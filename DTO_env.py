@@ -20,11 +20,23 @@ class StepInfo:
     makespan_by_ue: Dict[int, float]
 
 class DTOEnv(gym.Env):
-    def __init__(self, scheduler):
+    def __init__(
+        self,
+        scheduler,
+        *,
+        reward_oracle: str = "local",
+        reward_scale: bool = False,
+    ):
+        """
+        reward_oracle: "local" (baseline 全部本地) | "greedy" (每步选最优 loc)
+        reward_scale: 是否对 reward 做相对缩放 (prev-curr)/max(prev, 1e-9)
+        """
         super(DTOEnv).__init__()
 
         self.scheduler = scheduler
         self.es_numbers = scheduler.es_numbers
+        self.reward_oracle = reward_oracle
+        self.reward_scale = reward_scale
 
         """以下为内部状态(内部频繁更改)"""
         self._unscheduled: set[int] = set()
@@ -332,9 +344,15 @@ class DTOEnv(gym.Env):
         return self.step_with_decision(node_id, loc_choice)
 
     def _compute_reward(self):
-        mean_eft = self.scheduler.estimate_complete_mean_eft_by_copy(self._unscheduled)
+        if self.reward_oracle == "greedy":
+            mean_eft = self.scheduler.estimate_complete_mean_eft_by_copy_greedy(self._unscheduled)
+        else:
+            mean_eft = self.scheduler.estimate_complete_mean_eft_by_copy(self._unscheduled)
 
         reward = self.prev_mean_eft - mean_eft
+        if self.reward_scale:
+            scale = max(self.prev_mean_eft, 1e-9)
+            reward = reward / scale
         self.prev_mean_eft = mean_eft
         return reward
 

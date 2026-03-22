@@ -63,11 +63,11 @@ class TrainConfig:
     learning_rate: float = 3e-4
     n_steps: int = 2048
     batch_size: int = 256
-    gamma: float = 0.95
+    gamma: float = 0.99
     # 限制新旧策略差距
     clip_range: float = 0.2
-    # 训练策略的随机性
-    ent_coef: float = 0.0
+    # 训练策略的随机性（统一三种方法）
+    ent_coef: float = 0.01
     max_grad_norm: float = 0.5
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -89,6 +89,9 @@ class DAGConfig:
     f_es = 10e9  # 10 GHz
     tr_ue_es = 50e6 # ue_es传输速度
     tr_es_es = 200e6    # es_es传输速度
+    # 奖励函数: baseline (local oracle, no scale) | improved (greedy oracle + scale)
+    reward_oracle: str = "local"   # "local" | "greedy"
+    reward_scale: bool = False
 
 class DTODRLTrainer:
     def __init__(self,
@@ -199,8 +202,7 @@ class DTODRLTrainer:
             )
 
         elif model_type == "dtodrl":
-            # 论文 DTODRL 原方法: 与原文完全一致
-            # GAT 128/3头, Location(EFT,f)两维, MLP 256, Tanh, γ=0.99, ent_coef=0.01
+            # 论文 DTODRL 原方法: GAT + 2D location
             policy_kwargs = dict(
                 gat_hidden=128,
                 gat_heads=3,
@@ -217,9 +219,37 @@ class DTODRLTrainer:
                 learning_rate=self.config.learning_rate,
                 n_steps=self.config.n_steps,
                 batch_size=self.config.batch_size,
-                gamma=0.99,
+                gamma=self.config.gamma,
                 clip_range=self.config.clip_range,
-                ent_coef=0.01,
+                ent_coef=self.config.ent_coef,
+                max_grad_norm=self.config.max_grad_norm,
+                policy_kwargs=policy_kwargs,
+                tensorboard_log=self.run_dic,
+                verbose=1,
+                seed=self.config.seed,
+                device=self.config.device,
+            )
+
+        elif model_type == "dtodrl_tf":
+            # 横向对比: DTODRL 双头 + TransformerConv（与 Joint/Two-Stage 共用图编码）
+            policy_kwargs = dict(
+                use_transformer_backbone=True,
+                hidden_dim=self.config.features_dim,
+                gat_heads=4,
+                gat_layers=3,
+                mlp_hidden=256,
+                max_K=16,
+                max_N=200,
+            )
+            self.model = MaskablePPO(
+                policy=DTODRLMaskablePolicy,
+                env=self.vec_env,
+                learning_rate=self.config.learning_rate,
+                n_steps=self.config.n_steps,
+                batch_size=self.config.batch_size,
+                gamma=self.config.gamma,
+                clip_range=self.config.clip_range,
+                ent_coef=self.config.ent_coef,
                 max_grad_norm=self.config.max_grad_norm,
                 policy_kwargs=policy_kwargs,
                 tensorboard_log=self.run_dic,
@@ -281,7 +311,7 @@ class DTODRLTrainer:
 
         else:
             raise ValueError(
-                f"Unknown model_type={model_type}. Use 'joint' / 'two_stage' / 'dtodrl' / 'baseline'"
+                f"Unknown model_type={model_type}. Use 'joint' / 'two_stage' / 'dtodrl' / 'dtodrl_tf' / 'baseline'"
             )
 
     def train(self, model_type: str = "joint") -> str:
@@ -315,6 +345,9 @@ def build_env_from_dag_case(
         es_processors: int,
         tr_ue_es: float,
         tr_es_es: float,
+        *,
+        reward_oracle: str = "local",
+        reward_scale: bool = False,
 ):
     """
     独立建立env
@@ -369,7 +402,7 @@ def build_env_from_dag_case(
     )
 
     # Env
-    return DTOEnv(scheduler)
+    return DTOEnv(scheduler, reward_oracle=reward_oracle, reward_scale=reward_scale)
 
 def make_dto_env_controller(
         ue_number: int,
@@ -382,6 +415,9 @@ def make_dto_env_controller(
         tr_ue_es: float,
         tr_es_es: float,
         seed0: int = 0,
+        *,
+        reward_oracle: str = "local",
+        reward_scale: bool = False,
 ):
     # 以seed0为基准 创建 (seed0+i) 的controller
     counter = {"i": 0}
@@ -406,6 +442,8 @@ def make_dto_env_controller(
             es_processors=es_processors,
             tr_ue_es=tr_ue_es,
             tr_es_es=tr_es_es,
+            reward_oracle=reward_oracle,
+            reward_scale=reward_scale,
         )
     return _controller
 
@@ -503,6 +541,7 @@ def run_comparison_experiment(
     n_eval_episodes: int = 30,
     n_eval_seeds: int = 50,
     methods: Optional[List[str]] = None,
+    results_prefix: str = "comparison",
 ):
     """
     多方法对比实验:
@@ -522,6 +561,8 @@ def run_comparison_experiment(
         es_processors=4,
         tr_ue_es=dag_cfg.tr_ue_es,
         tr_es_es=dag_cfg.tr_es_es,
+        reward_oracle=getattr(dag_cfg, "reward_oracle", "local"),
+        reward_scale=getattr(dag_cfg, "reward_scale", False),
     )
 
     results = {}
@@ -533,6 +574,10 @@ def run_comparison_experiment(
 
         cfg = copy.deepcopy(train_cfg)
         cfg.runtime = f"DTO_DRL_{model_type}"
+        # 横向对比：所有图编码器端到端训练，不冻结
+        if model_type in ("dtodrl", "dtodrl_tf"):
+            cfg.dtodrl_pretrained_gat = None
+            cfg.dtodrl_freeze_pretrained_gat = False
         trainer = DTODRLTrainer(config=cfg, env_controller=rl_train_controller)
         trainer.build_vec_env()
         trainer.build_model(model_type=model_type)
@@ -560,6 +605,8 @@ def run_comparison_experiment(
                 es_processors=4,
                 tr_ue_es=dag_cfg.tr_ue_es,
                 tr_es_es=dag_cfg.tr_es_es,
+                reward_oracle=getattr(dag_cfg, "reward_oracle", "local"),
+                reward_scale=getattr(dag_cfg, "reward_scale", False),
             )
             env = ActionMasker(env, lambda e: e.action_masks())
             venv = DummyVecEnv([lambda e=env: e])
@@ -580,8 +627,9 @@ def run_comparison_experiment(
               f"makespan(avg)={results[model_type]['makespan_avg']:.6f}")
 
     # 打印对比表
+    title = "横向对比 (TransformerConv)" if "dtodrl_tf" in methods else "DTODRL vs Joint vs Two-Stage 对比结果"
     print(f"\n{'='*70}")
-    print("DTODRL vs Joint vs Two-Stage 对比结果")
+    print(title)
     print(f"{'='*70}")
     print(f"{'方法':<12} | {'meanAFT(avg)':>12} ± {'std':>8} | {'makespan(avg)':>12} ± {'std':>8}")
     print("-" * 70)
@@ -595,11 +643,143 @@ def run_comparison_experiment(
     import json
     os.makedirs(train_cfg.log_dir, exist_ok=True)
     ts = time.strftime("%Y%m%d-%H%M%S")
-    results_path = os.path.join(train_cfg.log_dir, f"comparison_results_{ts}.json")
+    results_path = os.path.join(train_cfg.log_dir, f"{results_prefix}_results_{ts}.json")
     with open(results_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
     print(f"结果已保存到 {results_path}\n")
 
+    return results
+
+
+def run_comparison_transformer_experiment(
+    train_cfg: TrainConfig,
+    dag_cfg: DAGConfig,
+    n_eval_episodes: int = 10,
+    n_eval_seeds: int = 30,
+):
+    """
+    横向对比实验: 三种方法统一使用 TransformerConv 图编码，全部端到端训练不冻结
+    - dtodrl_tf: DTODRL 双头 + TransformerConv（不冻结）
+    - joint: 联合打分 + TransformerConv（不冻结）
+    - two_stage: 两阶段 + TransformerConv（不冻结）
+    """
+    print("运行横向对比实验 (统一 TransformerConv，图编码器全部端到端训练不冻结)...")
+    return run_comparison_experiment(
+        train_cfg,
+        dag_cfg,
+        n_eval_episodes=n_eval_episodes,
+        n_eval_seeds=n_eval_seeds,
+        methods=["dtodrl_tf", "joint", "two_stage"],
+        results_prefix="comparison_transformer",
+    )
+
+
+def run_reward_comparison_experiment(
+    train_cfg: TrainConfig,
+    dag_cfg: DAGConfig,
+    model_type: str = "joint",
+    n_eval_seeds: int = 30,
+):
+    """
+    奖励函数对比实验：baseline (local oracle, no scale) vs improved (greedy oracle + scale)
+    默认用 joint 方法做对比，可指定 model_type
+    """
+    reward_configs = [
+        ("baseline", "local", False),
+        ("improved", "greedy", True),
+    ]
+
+    results = {}
+    for name, oracle, scale in reward_configs:
+        print(f"\n{'='*60}")
+        print(f"奖励配置: {name} (oracle={oracle}, scale={scale})")
+        print(f"训练 {model_type.upper()} ...")
+        print(f"{'='*60}")
+
+        cfg = copy.deepcopy(dag_cfg)
+        cfg.reward_oracle = oracle
+        cfg.reward_scale = scale
+
+        rl_train_controller = make_dto_env_controller(
+            ue_number=cfg.ue_numbers,
+            es_number=cfg.es_numbers,
+            n_compute_nodes_per_ue=20,
+            start_count_max=3,
+            f_ue=cfg.f_ue,
+            f_es=cfg.f_es,
+            es_processors=4,
+            tr_ue_es=cfg.tr_ue_es,
+            tr_es_es=cfg.tr_es_es,
+            reward_oracle=oracle,
+            reward_scale=scale,
+        )
+
+        train_cfg_copy = copy.deepcopy(train_cfg)
+        train_cfg_copy.runtime = f"DTO_DRL_{model_type}_reward_{name}"
+        trainer = DTODRLTrainer(config=train_cfg_copy, env_controller=rl_train_controller)
+        trainer.build_vec_env()
+        trainer.build_model(model_type=model_type)
+        save_path = trainer.train(model_type=model_type)
+        model = trainer.model
+        norm_path = os.path.join(trainer.run_dic, "vecnormalize.pkl")
+        print(f"  -> 模型已保存: {save_path}")
+
+        mean_aft_list, makespan_list = [], []
+        for s in range(n_eval_seeds):
+            case = make_dag_case(
+                ue_number=cfg.ue_numbers,
+                n_compute_nodes_per_ue=50,
+                start_count_max=3,
+                seed=1000 + s,
+            )
+            env = build_env_from_dag_case(
+                case=case,
+                ue_number=cfg.ue_numbers,
+                es_number=cfg.es_numbers,
+                f_ue=cfg.f_ue,
+                f_es=cfg.f_es,
+                es_processors=4,
+                tr_ue_es=cfg.tr_ue_es,
+                tr_es_es=cfg.tr_es_es,
+                reward_oracle=oracle,
+                reward_scale=scale,
+            )
+            env = ActionMasker(env, lambda e: e.action_masks())
+            venv = DummyVecEnv([lambda e=env: e])
+            if os.path.exists(norm_path):
+                venv = VecNormalize.load(norm_path, venv)
+                venv.training = False
+            mean_aft, makespan, _ = run_rl_episode_vec(venv, model, deterministic=True)
+            mean_aft_list.append(mean_aft)
+            makespan_list.append(makespan)
+
+        results[name] = {
+            "mean_AFT_avg": float(np.mean(mean_aft_list)),
+            "makespan_avg": float(np.mean(makespan_list)),
+            "mean_AFT_std": float(np.std(mean_aft_list)),
+            "makespan_std": float(np.std(makespan_list)),
+        }
+        print(f"  -> meanAFT(avg)={results[name]['mean_AFT_avg']:.6f}, "
+              f"makespan(avg)={results[name]['makespan_avg']:.6f}")
+
+    print(f"\n{'='*70}")
+    print("奖励函数对比结果 (baseline vs improved)")
+    print(f"{'='*70}")
+    print(f"{'奖励配置':<12} | {'meanAFT(avg)':>12} ± {'std':>8} | {'makespan(avg)':>12} ± {'std':>8}")
+    print("-" * 70)
+    for name in ["baseline", "improved"]:
+        r = results[name]
+        print(f"{name:<12} | {r['mean_AFT_avg']:>12.4f} ± {r['mean_AFT_std']:>8.4f} | "
+              f"{r['makespan_avg']:>12.4f} ± {r['makespan_std']:>8.4f}")
+    print(f"{'='*70}\n")
+
+    os.makedirs(train_cfg.log_dir, exist_ok=True)
+    import json
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(train_cfg.log_dir, f"reward_comparison_{ts}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    print(f"结果已保存到 {path}\n")
     return results
 
 
@@ -643,20 +823,34 @@ if __name__ == "__main__":
 
     dag_cfg = DAGConfig()
 
-    # 通过命令行参数选择: joint | two_stage | comparison
+    # 通过命令行参数选择: joint | two_stage | dtodrl | dtodrl_tf | comparison | comparison_transformer | reward_comparison
     mode = sys.argv[1] if len(sys.argv) > 1 else "joint"
 
     if mode == "comparison":
-        # DTODRL vs Joint vs Two-Stage 对比实验
+        # DTODRL vs Joint vs Two-Stage 对比实验（各自原图编码）
         print("运行 DTODRL vs Joint vs Two-Stage 对比实验...")
         run_comparison_experiment(
             train_cfg, dag_cfg,
             n_eval_episodes=10, n_eval_seeds=30,
             methods=["dtodrl", "joint", "two_stage"],
         )
+    elif mode == "comparison_transformer":
+        # 横向对比: 三种方法统一 TransformerConv 图编码
+        run_comparison_transformer_experiment(
+            train_cfg, dag_cfg,
+            n_eval_episodes=10, n_eval_seeds=30,
+        )
+    elif mode == "reward_comparison":
+        # 奖励函数对比: baseline (local) vs improved (greedy + scale)
+        print("运行奖励函数对比实验 (baseline vs improved)...")
+        run_reward_comparison_experiment(
+            train_cfg, dag_cfg,
+            model_type=sys.argv[2] if len(sys.argv) > 2 else "joint",
+            n_eval_seeds=30,
+        )
     else:
         # 单方法训练
-        model_type = mode if mode in ("joint", "two_stage", "dtodrl") else "joint"
+        model_type = mode if mode in ("joint", "two_stage", "dtodrl", "dtodrl_tf") else "joint"
         rl_train_controller = make_dto_env_controller(
             ue_number=dag_cfg.ue_numbers,
             es_number=dag_cfg.es_numbers,
@@ -667,6 +861,8 @@ if __name__ == "__main__":
             es_processors=4,
             tr_ue_es=dag_cfg.tr_ue_es,
             tr_es_es=dag_cfg.tr_es_es,
+            reward_oracle=getattr(dag_cfg, "reward_oracle", "local"),
+            reward_scale=getattr(dag_cfg, "reward_scale", False),
         )
 
         trainer = DTODRLTrainer(config=train_cfg, env_controller=rl_train_controller)

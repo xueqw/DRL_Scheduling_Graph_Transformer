@@ -14,6 +14,7 @@ from stable_baselines3.common.type_aliases import PyTorchObs, Schedule
 from sb3_contrib.common.maskable.policies import MaskableActorCriticPolicy
 
 from dtodrl_backbone import DTODRLBackbone
+from Graph_policy import GraphBackbone
 from joint_policy import JointCritic
 from dtodrl_policy import DTODRLActor
 
@@ -63,6 +64,7 @@ class DTODRLMaskablePolicy(MaskableActorCriticPolicy):
         max_N: int = 200,
         pretrained_gat_path: Optional[str] = None,
         freeze_pretrained_gat: bool = True,
+        use_transformer_backbone: bool = False,
         **kwargs,
     ):
         self.dtodrl_max_N = max_N
@@ -78,25 +80,39 @@ class DTODRLMaskablePolicy(MaskableActorCriticPolicy):
         self.features_extractor = _IdentityExtractor(observation_space)
         self.mlp_extractor = _DummyMlpExtractor()
 
-        # 论文专用: 标准 GAT, 位置 (EFT,f) 两维
-        self.backbone = DTODRLBackbone(
-            node_feature_dim=6,
-            location_feature_dim=2,
-            gat_hidden=gat_hidden,
-            gat_heads=gat_heads,
-            gat_layers=gat_layers,
-            mlp_hidden=mlp_hidden,
-        )
+        if use_transformer_backbone:
+            # 横向对比: 与 Joint/Two-Stage 共用 TransformerConv + 3D location
+            hidden = kwargs.get("hidden_dim", 108)
+            self.backbone = GraphBackbone(
+                node_feature_dim=6,
+                location_feature_dim=3,
+                hidden_dim=hidden,
+                gat_heads=kwargs.get("gat_heads", 4),
+                gat_layers=kwargs.get("gat_layers", 3),
+            )
+            backbone_hidden = hidden
+            pretrained_gat_path = None
+        else:
+            # 论文原方法: GAT + 2D location
+            self.backbone = DTODRLBackbone(
+                node_feature_dim=6,
+                location_feature_dim=2,
+                gat_hidden=gat_hidden,
+                gat_heads=gat_heads,
+                gat_layers=gat_layers,
+                mlp_hidden=mlp_hidden,
+            )
+            backbone_hidden = gat_hidden
 
         self.actor = DTODRLActor(
-            hidden_dim=gat_hidden,
+            hidden_dim=backbone_hidden,
             mlp_hidden=mlp_hidden,
             max_N=getattr(self, "dtodrl_max_N", 200),
             max_K=max_K,
         )
-        self.critic = JointCritic(hidden_dim=gat_hidden)
+        self.critic = JointCritic(hidden_dim=backbone_hidden)
 
-        if pretrained_gat_path:
+        if pretrained_gat_path and not use_transformer_backbone:
             state = torch.load(pretrained_gat_path, map_location="cpu")
             if isinstance(state, dict) and "encoder" in state:
                 state = state["encoder"]

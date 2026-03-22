@@ -275,15 +275,35 @@ class DTOScheduler:
         return loc, processor, finish_time
 
     def estimate_complete_mean_eft_by_copy(self, unscheduled):
+        """
+        论文 baseline：对剩余节点全部使用本地执行 (loc=0) 预估 mean_eft
+        """
         scheduler_copy = copy.deepcopy(self)
         unscheduled_copy = set(unscheduled)
 
         while unscheduled_copy:
             for node_id in list(unscheduled_copy):
                 preds = [p for p in scheduler_copy.nodes[node_id].pred if p not in scheduler_copy.end_nodes]
-                # 执行顺序不改变最终输出时间 因为都是单执行器按序处理
                 if all(p in scheduler_copy.aft for p in preds):
                     scheduler_copy.schedule_node_at(node_id, 0)
+                    unscheduled_copy.remove(node_id)
+                    break
+
+        return sum(scheduler_copy.download_EAT.values()) / scheduler_copy.ue_numbers
+
+    def estimate_complete_mean_eft_by_copy_greedy(self, unscheduled):
+        """
+        改进 oracle：对剩余节点使用 greedy（每步选 EFT 最小的 loc）预估 mean_eft
+        与 schedule_node 逻辑一致，更接近真实下界
+        """
+        scheduler_copy = copy.deepcopy(self)
+        unscheduled_copy = set(unscheduled)
+
+        while unscheduled_copy:
+            for node_id in list(unscheduled_copy):
+                preds = [p for p in scheduler_copy.nodes[node_id].pred if p not in scheduler_copy.end_nodes]
+                if all(p in scheduler_copy.aft for p in preds):
+                    scheduler_copy.schedule_node(node_id)
                     unscheduled_copy.remove(node_id)
                     break
 
