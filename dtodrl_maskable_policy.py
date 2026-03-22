@@ -68,6 +68,13 @@ class DTODRLMaskablePolicy(MaskableActorCriticPolicy):
         **kwargs,
     ):
         self.dtodrl_max_N = max_N
+        # 提取 dtodrl_tf 专用参数后过滤，避免传给父类 MaskableActorCriticPolicy
+        hidden_dim = kwargs.pop("hidden_dim", 108)
+        tf_gat_heads = kwargs.pop("gat_heads", 4)
+        tf_gat_layers = kwargs.pop("gat_layers", 3)
+        for k in ("mlp_hidden", "max_K", "max_N", "use_transformer_backbone",
+                  "pretrained_gat_path", "freeze_pretrained_gat"):
+            kwargs.pop(k, None)
         super().__init__(
             observation_space,
             action_space,
@@ -82,15 +89,14 @@ class DTODRLMaskablePolicy(MaskableActorCriticPolicy):
 
         if use_transformer_backbone:
             # 横向对比: 与 Joint/Two-Stage 共用 TransformerConv + 3D location
-            hidden = kwargs.get("hidden_dim", 108)
             self.backbone = GraphBackbone(
                 node_feature_dim=6,
                 location_feature_dim=3,
-                hidden_dim=hidden,
-                gat_heads=kwargs.get("gat_heads", 4),
-                gat_layers=kwargs.get("gat_layers", 3),
+                hidden_dim=hidden_dim,
+                gat_heads=tf_gat_heads,
+                gat_layers=tf_gat_layers,
             )
-            backbone_hidden = hidden
+            backbone_hidden = hidden_dim
             pretrained_gat_path = None
         else:
             # 论文原方法: GAT + 2D location

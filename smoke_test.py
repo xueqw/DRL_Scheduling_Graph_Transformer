@@ -1,7 +1,10 @@
 import random
 
-from GNNDAG import dag_generator, DTO_scheduler, location_generator, DTO_env
-from GNNDAG.validator import DTOValidator
+import dag_generator
+import DTO_scheduler
+import location_generator
+import DTO_env
+from validator import DTOValidator
 
 EPS = 1e-9
 
@@ -133,7 +136,7 @@ def set_env():
 
     env = DTO_env.DTOEnv(scheduler)
 
-    return env
+    return env, scheduler
 
 def test_for_observation():
     env, scheduler = set_env()
@@ -146,7 +149,7 @@ def test_for_observation():
         # 建议排除 end_nodes（你现在已经决定 obs 不包含 end）
         # 如果 observation 里有 end_nodes，你也可以用 observation["end_nodes"]
         end_nodes = getattr(env, "end_nodes", set())
-        observation["node_ids"] = sorted(nid for nid in nodes.keys() if nid not in end_nodes)
+        observation["node_ids"] = sorted(nid for nid in scheduler.nodes.keys() if nid not in end_nodes)
 
     while True:
         mask = observation["mask"]

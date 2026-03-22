@@ -250,9 +250,7 @@ class GraphDictFeaturesExtractor(BaseFeaturesExtractor):
             B, N, Fdim = node_features.shape
             node_features = node_features.reshape(B * N, Fdim)
 
-        # 建议做个边特征归一化，避免 bits 数值太大
-        edge_attr = torch.log1p(edge_attr)
-
+        # edge_attr 已在 env.build_obs 中做 log1p，此处直接使用
         graph_emb = self.node_encoder(
             node_features=node_features.to(device),
             edge_index=edge_index.to(device),
@@ -345,9 +343,7 @@ class GraphBackbone(nn.Module):
             B, N, Fdim = node_features.shape
             node_features = node_features.reshape(B * N, Fdim)
 
-        # 数据压缩
-        # 边特征
-        edge_attr = torch.log1p(edge_attr)
+        # edge_attr 已在 env.build_obs 中做 log1p
 
         # 保持节点embedding 不走平均池化 方便做出节点选择
         node_embs = self.node_encoder(

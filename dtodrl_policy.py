@@ -97,7 +97,9 @@ class DTODRLActor(nn.Module):
         if action_masks is not None:
             if action_masks.dim() == 1:
                 action_masks = action_masks.unsqueeze(0)
-            pair_mask = action_masks.reshape(B, N, K)
+            if not torch.is_tensor(action_masks):
+                action_masks = torch.as_tensor(action_masks, device=node_embs.device)
+            pair_mask = action_masks.reshape(B, N, K).bool()
             node_mask = pair_mask.any(dim=2)
         else:
             node_mask = torch.ones(B, N, dtype=torch.bool, device=node_embs.device)
