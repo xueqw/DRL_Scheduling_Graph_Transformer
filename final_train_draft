@@ -1,0 +1,550 @@
+"""
+完整的DTODRL训练和测试脚本
+整合GAT预训练模型、DTO环境和PPO算法
+"""
+
+import torch
+import numpy as np
+import gymnasium as gym
+from sb3_contrib import MaskablePPO
+from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
+import matplotlib.pyplot as plt
+from typing import Dict, List, Tuple, Optional, Optional
+import json
+import os
+import time
+from dataclasses import dataclass
+import argparse
+
+# 导入你的模块 - 适配GNNDAG项目结构
+import sys
+import os
+
+# 获取当前脚本所在目录（GNNDAG项目根目录）
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(current_dir)
+
+# 设置项目路径
+PROJECT_ROOT = current_dir
+MODELS_DIR = os.path.join(PROJECT_ROOT, 'models')
+RESULTS_DIR = os.path.join(PROJECT_ROOT, 'results')
+TENSORBOARD_DIR = os.path.join(PROJECT_ROOT, 'tensorboard')
+
+# 创建必要的目录
+os.makedirs(MODELS_DIR, exist_ok=True)
+os.makedirs(RESULTS_DIR, exist_ok=True)
+os.makedirs(TENSORBOARD_DIR, exist_ok=True)
+
+try:
+    from DTO_env import DTOEnv
+    from DTO_scheduler import DTOScheduler, Node, Location, Processor, ExecutionModel, UploadModel, TransmissionModel
+    from GAT_policy import ImprovedGATPolicy
+except ImportError as e:
+    print(f"导入错误: {e}")
+    print("请确保所有模块文件都在正确的路径中")
+
+
+@dataclass
+class TrainingConfig:
+    """训练配置"""
+    # 环境参数
+    num_ues: int = 3
+    num_es: int = 2
+    min_nodes: int = 8
+    max_nodes: int = 15
+
+    # 网络参数
+    cpu_speed_ue: float = 1e9  # 1GHz
+    cpu_speed_es: float = 10e9  # 10GHz
+    transmission_rate_ue_es: float = 2e6  # 2Mbps
+    transmission_rate_es_es: float = 20e6  # 20Mbps
+
+    # 训练参数
+    total_timesteps: int = 500000
+    n_steps: int = 512
+    batch_size: int = 64
+    learning_rate: float = 3e-4
+    gamma: float = 0.99
+
+    # GAT参数
+    gat_hidden_dim: int = 128
+    gat_heads: int = 4
+    gat_layers: int = 3
+
+    # 其他
+    n_eval_episodes: int = 10
+    eval_freq: int = 10000
+    save_freq: int = 50000
+
+    def to_dict(self):
+        return {k: v for k, v in self.__dict__.items()}
+
+
+class DAGGenerator:
+    """DAG任务生成器"""
+
+    def __init__(self, min_nodes: int = 8, max_nodes: int = 15):
+        self.min_nodes = min_nodes
+        self.max_nodes = max_nodes
+
+    def generate_dag_for_ue(self, ue_id: int, num_nodes: int = None) -> Tuple[Dict[int, Node], Dict[Tuple[int, int], float]]:
+        """为指定UE生成DAG任务"""
+        if num_nodes is None:
+            num_nodes = np.random.randint(self.min_nodes, self.max_nodes + 1)
+
+        nodes = {}
+        edges_data = {}
+
+        # 创建节点（包括start和end节点）
+        for i in range(num_nodes):
+            if i == 0:  # Start节点
+                C, D = 0.0, 0.0
+                pred, succ = [], [1] if num_nodes > 1 else []
+            elif i == num_nodes - 1:  # End节点
+                C, D = 0.0, 0.0
+                pred, succ = [i-1], []
+            else:  # 普通节点
+                C = np.random.uniform(1e8, 1e9)  # CPU cycles
+                D = np.random.uniform(20, 200)   # KB
+                pred = []
+                succ = []
+
+                # 添加前驱节点
+                if i > 1:
+                    num_pred = np.random.randint(1, min(i, 3))
+                    pred = sorted(np.random.choice(range(i), num_pred, replace=False))
+                else:
+                    pred = [0]
+
+                # 添加后继节点
+                if i < num_nodes - 2:
+                    max_succ = min(3, num_nodes - i - 1)
+                    num_succ = np.random.randint(1, max_succ + 1)
+                    succ = sorted(np.random.choice(range(i+1, num_nodes), num_succ, replace=False))
+                else:
+                    succ = [num_nodes - 1]
+
+            nodes[i] = Node(id=i, C=C, D=D, pred=pred, succ=succ, ue_id=ue_id)
+
+        # 创建边数据
+        for node_id, node in nodes.items():
+            for succ_id in node.succ:
+                edge_data = np.random.uniform(100, 500)  # KB
+                edges_data[(node_id, succ_id)] = edge_data
+
+        return nodes, edges_data
+
+
+class ModernGymWrapper(gym.Wrapper):
+    """现代Gymnasium兼容的环境包装器"""
+
+    def __init__(self, env):
+        super().__init__(env)
+        self._seed = None
+
+    def reset(self, seed=None, options=None):
+        """现代Gymnasium风格的reset"""
+        if seed is not None:
+            self._seed = seed
+            # 设置环境内部的随机状态
+            np.random.seed(seed)
+            if hasattr(self.env, 'np_random'):
+                self.env.np_random = np.random.RandomState(seed)
+
+        # 调用原始环境的reset
+        if hasattr(self.env, 'reset'):
+            result = self.env.reset()
+            if isinstance(result, tuple) and len(result) == 2:
+                return result
+            else:
+                return result, {}
+        else:
+            raise NotImplementedError("Environment must implement reset method")
+
+    def seed(self, seed=None):
+        """保持向后兼容的seed方法"""
+        self._seed = seed
+        if hasattr(self.env, 'action_space'):
+            self.env.action_space.seed(seed)
+        if hasattr(self.env, 'observation_space'):
+            self.env.observation_space.seed(seed)
+        return [seed]
+
+
+def set_global_seed(seed: int):
+    """设置全局随机种子"""
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    # 设置确定性行为（可选，会影响性能）
+    # torch.backends.cudnn.deterministic = True
+    # torch.backends.cudnn.benchmark = False
+
+
+def create_dto_environment(config: TrainingConfig, seed: Optional[int] = None) -> DTOEnv:
+    """创建DTO环境"""
+
+    # 生成DAG任务
+    generator = DAGGenerator(config.min_nodes, config.max_nodes)
+
+    all_nodes = {}
+    all_edges_data = {}
+    end_nodes = []
+    download_nodes = []
+
+    node_id_offset = 0
+
+    for ue_id in range(config.num_ues):
+        nodes, edges_data = generator.generate_dag_for_ue(ue_id)
+
+        # 重新编号节点以避免冲突
+        for old_id, node in nodes.items():
+            new_id = old_id + node_id_offset
+            node.id = new_id
+
+            # 更新前驱和后继
+            node.pred = [p + node_id_offset for p in node.pred]
+            node.succ = [s + node_id_offset for s in node.succ]
+
+            all_nodes[new_id] = node
+
+            # 记录end节点
+            if old_id == len(nodes) - 1:
+                end_nodes.append(new_id)
+                # 前一个节点是download节点
+                if len(nodes) > 1:
+                    download_nodes.append(new_id - 1)
+
+        # 更新边数据
+        for (src, dst), data in edges_data.items():
+            new_src = src + node_id_offset
+            new_dst = dst + node_id_offset
+            all_edges_data[(new_src, new_dst)] = data
+
+        node_id_offset += len(nodes)
+
+    # 创建位置（UE和ES）
+    locations = []
+
+    # 添加UE位置
+    for ue_id in range(config.num_ues):
+        processors = [Processor(id=0)]
+        locations.append(Location(
+            id=0,  # 本地UE用id=0表示
+            ue_id=ue_id,
+            cpu_speed=config.cpu_speed_ue,
+            processors=processors
+        ))
+
+    # 添加ES位置
+    for es_id in range(1, config.num_es + 1):
+        processors = [Processor(id=i) for i in range(2)]  # 每个ES有2个处理器
+        locations.append(Location(
+            id=es_id,
+            ue_id=None,
+            cpu_speed=config.cpu_speed_es,
+            processors=processors
+        ))
+
+    # 创建模型
+    exec_model = ExecutionModel()
+    upload_model = UploadModel(config.transmission_rate_ue_es)
+    trans_model = TransmissionModel(
+        config.transmission_rate_ue_es,
+        config.transmission_rate_es_es
+    )
+
+    # 创建调度器
+    scheduler = DTOScheduler(
+        nodes=all_nodes,
+        edges_data=all_edges_data,
+        locations=locations,
+        exec_model=exec_model,
+        upload_model=upload_model,
+        trans_model=trans_model,
+        end_nodes=end_nodes,
+        download_nodes=download_nodes,
+        ue_number=config.num_ues,
+        es_number=config.num_es
+    )
+
+    # 创建环境
+    env = DTOEnv(scheduler)
+
+    # 使用现代Gymnasium兼容包装器
+    env = ModernGymWrapper(env)
+
+    # 设置随机种子
+    if seed is not None:
+        env.seed(seed)
+
+    return env
+
+
+def load_pretrained_gat_weights(policy, weights_path: str):
+    """加载预训练的GAT权重"""
+    if os.path.exists(weights_path):
+        try:
+            pretrained_dict = torch.load(weights_path, map_location='cpu')
+            policy_dict = policy.state_dict()
+
+            # 过滤出匹配的权重
+            pretrained_dict = {k: v for k, v in pretrained_dict.items()
+                             if k in policy_dict and v.shape == policy_dict[k].shape}
+
+            policy_dict.update(pretrained_dict)
+            policy.load_state_dict(policy_dict)
+
+            print(f"成功加载预训练权重: {weights_path}")
+            return True
+        except Exception as e:
+            print(f"加载预训练权重失败: {e}")
+            return False
+    else:
+        print(f"预训练权重文件不存在: {weights_path}")
+        return False
+
+
+def evaluate_policy(model, env, n_episodes: int = 10) -> Dict[str, float]:
+    """评估策略性能"""
+    total_rewards = []
+    makespans = []
+    episode_lengths = []
+
+    for _ in range(n_episodes):
+        obs, _ = env.reset()
+        done = False
+        total_reward = 0
+        steps = 0
+
+        while not done:
+            action_masks = env.action_masks()
+            action, _ = model.predict(obs, action_masks=action_masks, deterministic=True)
+            obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+            total_reward += reward
+            steps += 1
+
+        total_rewards.append(total_reward)
+        episode_lengths.append(steps)
+
+        # 计算makespan
+        if hasattr(env, 'scheduler') and hasattr(env.scheduler, 'aft'):
+            makespan = max(env.scheduler.aft.values()) if env.scheduler.aft else 0
+            makespans.append(makespan)
+
+    results = {
+        'mean_reward': np.mean(total_rewards),
+        'std_reward': np.std(total_rewards),
+        'mean_episode_length': np.mean(episode_lengths),
+        'mean_makespan': np.mean(makespans) if makespans else 0,
+        'std_makespan': np.std(makespans) if makespans else 0
+    }
+
+    return results
+
+
+def compare_with_baselines(env, model, n_episodes: int = 10):
+    """与基线方法对比"""
+    print("\n=== 与基线方法对比 ===")
+
+    results = {}
+
+    # 评估我们的方法
+    print("评估DTODRL...")
+    dtodrl_results = evaluate_policy(model, env, n_episodes)
+    results['DTODRL'] = dtodrl_results
+
+    # 评估贪婪方法
+    print("评估贪婪方法...")
+    greedy_rewards = []
+    greedy_makespans = []
+
+    for _ in range(n_episodes):
+        obs, _ = env.reset()
+        total_reward = 0
+
+        while not env.done():
+            ready_nodes = env.ready_nodes()
+            if ready_nodes:
+                # 贪婪选择第一个可用节点
+                node_id = ready_nodes[0]
+                obs, reward, terminated, truncated, info = env.step_greedy(node_id)
+                total_reward += reward
+
+        greedy_rewards.append(total_reward)
+        makespan = max(env.scheduler.aft.values()) if env.scheduler.aft else 0
+        greedy_makespans.append(makespan)
+
+    results['Greedy'] = {
+        'mean_reward': np.mean(greedy_rewards),
+        'std_reward': np.std(greedy_rewards),
+        'mean_makespan': np.mean(greedy_makespans),
+        'std_makespan': np.std(greedy_makespans)
+    }
+
+    # 打印结果
+    for method, metrics in results.items():
+        print(f"\n{method}:")
+        print(f"  平均奖励: {metrics['mean_reward']:.3f} ± {metrics['std_reward']:.3f}")
+        print(f"  平均makespan: {metrics['mean_makespan']:.3f} ± {metrics['std_makespan']:.3f}")
+
+    return results
+
+
+def plot_training_results(log_dir: str):
+    """绘制训练结果"""
+    # 这里需要根据实际的日志格式来实现
+    # 通常SB3会生成tensorboard日志
+    pass
+
+
+def main():
+    parser = argparse.ArgumentParser(description='DTODRL训练和测试')
+    parser.add_argument('--mode', choices=['train', 'test', 'compare'], default='train',
+                       help='运行模式')
+    parser.add_argument('--config', type=str, help='配置文件路径')
+    parser.add_argument('--model-path', type=str, help='模型路径')
+    parser.add_argument('--pretrained-gat', type=str,
+                       default='gat_autoencoder_final.pth',
+                       help='预训练GAT权重路径')
+    parser.add_argument('--seed', type=int, default=42, help='随机种子')
+
+    args = parser.parse_args()
+
+    # 设置随机种子
+    set_global_seed(args.seed)
+
+    # 加载配置
+    config = TrainingConfig()
+    if args.config and os.path.exists(args.config):
+        with open(args.config, 'r') as f:
+            config_dict = json.load(f)
+            for k, v in config_dict.items():
+                if hasattr(config, k):
+                    setattr(config, k, v)
+
+    print("配置参数:")
+    print(json.dumps(config.to_dict(), indent=2))
+
+    # 创建输出目录（使用项目相对路径）
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    os.makedirs(TENSORBOARD_DIR, exist_ok=True)
+
+    if args.mode == 'train':
+        print("\n=== 开始训练 ===")
+
+        # 创建环境
+        print("创建训练环境...")
+        train_env = create_dto_environment(config, seed=args.seed)
+        eval_env = create_dto_environment(config, seed=args.seed + 1000)
+
+        # 包装环境
+        train_env = DummyVecEnv([lambda: train_env])
+        eval_env = DummyVecEnv([lambda: eval_env])
+
+        # 创建模型
+        print("创建DTODRL模型...")
+        model = MaskablePPO(
+            ImprovedGATPolicy,
+            train_env,
+            learning_rate=config.learning_rate,
+            gamma=config.gamma,
+            n_steps=config.n_steps,
+            batch_size=config.batch_size,
+            verbose=1,
+            tensorboard_log=TENSORBOARD_DIR,
+            policy_kwargs={
+                'hidden_dim': config.gat_hidden_dim,
+                'gat_heads': config.gat_heads,
+                'gat_layers': config.gat_layers
+            }
+        )
+
+        # 加载预训练GAT权重（如果存在）
+        if args.pretrained_gat:
+            load_pretrained_gat_weights(model.policy, args.pretrained_gat)
+
+        # 设置回调
+        checkpoint_callback = CheckpointCallback(
+            save_freq=config.save_freq,
+            save_path=MODELS_DIR,
+            name_prefix='dtodrl'
+        )
+
+        eval_callback = EvalCallback(
+            eval_env,
+            best_model_save_path=MODELS_DIR,
+            log_path=RESULTS_DIR,
+            eval_freq=config.eval_freq,
+            n_eval_episodes=config.n_eval_episodes,
+            deterministic=True,
+            render=False
+        )
+
+        # 开始训练
+        print(f"开始训练，总步数: {config.total_timesteps}")
+        start_time = time.time()
+
+        model.learn(
+            total_timesteps=config.total_timesteps,
+            callback=[checkpoint_callback, eval_callback]
+        )
+
+        training_time = time.time() - start_time
+        print(f"训练完成，用时: {training_time:.2f}秒")
+
+        # 保存最终模型
+        final_model_path = os.path.join(MODELS_DIR, 'dtodrl_final')
+        model.save(final_model_path)
+        print(f"模型已保存到: {final_model_path}")
+
+    elif args.mode == 'test':
+        print("\n=== 测试模型 ===")
+
+        if not args.model_path or not os.path.exists(args.model_path):
+            print("请提供有效的模型路径")
+            return
+
+        # 创建环境
+        env = create_dto_environment(config, seed=args.seed)
+
+        # 加载模型
+        model = MaskablePPO.load(args.model_path, env=env)
+
+        # 评估
+        results = evaluate_policy(model, env, config.n_eval_episodes)
+
+        print("测试结果:")
+        print(json.dumps(results, indent=2))
+
+    elif args.mode == 'compare':
+        print("\n=== 对比实验 ===")
+
+        if not args.model_path or not os.path.exists(args.model_path):
+            print("请提供有效的模型路径")
+            return
+
+        # 创建环境
+        env = create_dto_environment(config, seed=args.seed)
+
+        # 加载模型
+        model = MaskablePPO.load(args.model_path, env=env)
+
+        # 进行对比
+        results = compare_with_baselines(env, model, config.n_eval_episodes)
+
+        # 保存结果
+        comparison_results_path = os.path.join(RESULTS_DIR, 'comparison_results.json')
+        with open(comparison_results_path, 'w') as f:
+            json.dump(results, f, indent=2)
+
+        print(f"对比结果已保存到: {comparison_results_path}")
+
+
+if __name__ == "__main__":
+    main()

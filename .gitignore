@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 训练输出
+runs/
+*.zip
+*.pkl
+*.pt
+*.pth
+gat_pretrained.pt
+
+# 日志
+*.log
+tensorboard/
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
