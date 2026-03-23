@@ -78,10 +78,8 @@ class TwoStageActor(nn.Module):
         if action_masks is not None:
             if action_masks.dim() == 1:
                 action_masks = action_masks.unsqueeze(0)
-            if not torch.is_tensor(action_masks):
-                action_masks = torch.as_tensor(action_masks, device=node_embs.device)
-            # pair_mask[b,i,j] = mask[b, i*K+j]，确保 bool 以支持 ~ 运算符
-            pair_mask = action_masks.reshape(B, N, K).bool()
+            # pair_mask[b,i,j] = mask[b, i*K+j]
+            pair_mask = action_masks.reshape(B, N, K)
             node_mask = pair_mask.any(dim=2)  # (B,N), 至少有一个 loc 合法的 node
         else:
             pair_mask = torch.ones(B, N, K, dtype=torch.bool, device=node_embs.device)
@@ -101,7 +99,7 @@ class TwoStageActor(nn.Module):
 
         # 无效动作置为极小值，后续 apply_masking 会再次处理
         if action_masks is not None:
-            flat_mask = action_masks.reshape(B, N * K).bool()
+            flat_mask = action_masks.reshape(B, N * K)
             logits = logits.masked_fill(~flat_mask, -1e9)
 
         if squeeze_batch:

@@ -8,12 +8,68 @@ DTODRL 论文原方法 Baseline
 - Node Head: 统一 state 向量 → 一次输出 N 维 logits
 - Location Head: loc_head(state)，与 Node Head 共享同一 state
 - 仅 node mask，无 pair mask
-- State = concat(flatten(stask), slocations)
+- State = flatten(concat(stask, slocations))，先 concat 再展平
+- 两个独立 Categorical: dist_node, dist_loc，采样 node ~ dist_node, loc ~ dist_loc，action = node*K+loc
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
+from typing import Optional, Tuple
+
+from sb3_contrib.common.maskable.distributions import MaskableDistribution
+from torch.distributions import Categorical
+
+
+class TwoHeadMaskableCategoricalDistribution(MaskableDistribution):
+    """
+    两个独立 Categorical: dist_node, dist_loc
+    - dist_node = Categorical(logits=node_scores_masked)
+    - dist_loc = Categorical(logits=loc_scores)
+    - 采样: node ~ dist_node, loc ~ dist_loc, action = node*K + loc
+    - log_prob(a) = log_prob_node(a_node) + log_prob_loc(a_loc)
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def proba_distribution_net(self, latent_dim: int) -> nn.Module:
+        """不使用，logits 由 Actor 直接输出"""
+        return nn.Identity()
+
+    def proba_distribution(
+        self,
+        node_scores_masked: torch.Tensor,
+        loc_scores: torch.Tensor,
+    ) -> "TwoHeadMaskableCategoricalDistribution":
+        if node_scores_masked.dim() == 1:
+            node_scores_masked = node_scores_masked.unsqueeze(0)
+            loc_scores = loc_scores.unsqueeze(0)
+        self.dist_node = Categorical(logits=node_scores_masked)
+        self.dist_loc = Categorical(logits=loc_scores)
+        self._K = loc_scores.shape[-1]
+        return self
+
+    def sample(self) -> torch.Tensor:
+        node = self.dist_node.sample()
+        loc = self.dist_loc.sample()
+        return node * self._K + loc
+
+    def mode(self) -> torch.Tensor:
+        node = self.dist_node.logits.argmax(dim=-1)
+        loc = self.dist_loc.logits.argmax(dim=-1)
+        return node * self._K + loc
+
+    def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
+        node = (actions // self._K).long().clamp(0, self.dist_node.logits.shape[-1] - 1)
+        loc = (actions % self._K).long().clamp(0, self.dist_loc.logits.shape[-1] - 1)
+        return self.dist_node.log_prob(node) + self.dist_loc.log_prob(loc)
+
+    def entropy(self) -> torch.Tensor:
+        return self.dist_node.entropy() + self.dist_loc.entropy()
+
+    def apply_masking(self, masks=None) -> None:
+        """node mask 已在 Actor 中融入 node_scores_masked，此处无需再处理"""
+        pass
 
 
 class DTODRLActor(nn.Module):
@@ -34,7 +90,7 @@ class DTODRLActor(nn.Module):
         super().__init__()
         self.max_N = max_N
         self.max_K = max_K
-        # Node Head: 论文 统一 state → N 维, state = flatten(node_embs) + flatten(loc_K_embs)
+        # Node Head: 论文 统一 state → N 维, state = flatten(concat(stask, slocations))
         # in = max_N*d + max_K*d
         self.node_head = nn.Sequential(
             nn.Linear(max_N * hidden_dim + max_K * hidden_dim, mlp_hidden),
@@ -56,10 +112,13 @@ class DTODRLActor(nn.Module):
         node_embs: torch.Tensor,
         loc_K_embs: torch.Tensor,
         action_masks: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         node_embs: (B, N, d)
         loc_K_embs: (B, K, d) 论文 slocations 的 K 个位置 embedding
+        Returns:
+            node_scores_masked: (B, N) 已做 node mask
+            loc_scores: (B, K)
         """
         squeeze_batch = False
         if node_embs.dim() == 2:
@@ -73,17 +132,15 @@ class DTODRLActor(nn.Module):
         if N > self.max_N or K > self.max_K:
             raise ValueError(f"N={N} K={K} exceeds max_N={self.max_N} max_K={self.max_K}")
 
-        # ----- 论文: State = concat(flatten(stask), slocations) -----
-        node_flat = node_embs.reshape(B, -1)  # (B, N*d)
-        loc_flat = loc_K_embs.reshape(B, -1)   # (B, K*d)
-
-        # Pad to max dims for fixed Linear
+        # ----- 论文 logits 分离: h = f(s), state = flatten(concat(stask, slocations))，先 concat 再展平 -----
+        # Pad to max dims
         if N < self.max_N:
-            node_flat = F.pad(node_flat, (0, (self.max_N - N) * d), value=0)
+            node_embs = F.pad(node_embs, (0, 0, 0, self.max_N - N), value=0)  # (B, max_N, d)
         if K < self.max_K:
-            loc_flat = F.pad(loc_flat, (0, (self.max_K - K) * d), value=0)
-
-        state = torch.cat([node_flat, loc_flat], dim=-1)  # (B, max_N*d + max_K*d)
+            loc_K_embs = F.pad(loc_K_embs, (0, 0, 0, self.max_K - K), value=0)  # (B, max_K, d)
+        # 先 concat 再 flatten
+        state_seq = torch.cat([node_embs, loc_K_embs], dim=1)  # (B, max_N+max_K, d)
+        state = state_seq.reshape(B, -1)  # (B, (max_N+max_K)*d) = (B, max_N*d + max_K*d)
 
         # ----- Node Head: 统一 state → N 维 logits -----
         node_scores_full = self.node_head(state)  # (B, max_N)
@@ -97,24 +154,15 @@ class DTODRLActor(nn.Module):
         if action_masks is not None:
             if action_masks.dim() == 1:
                 action_masks = action_masks.unsqueeze(0)
-            if not torch.is_tensor(action_masks):
-                action_masks = torch.as_tensor(action_masks, device=node_embs.device)
-            pair_mask = action_masks.reshape(B, N, K).bool()
+            pair_mask = action_masks.reshape(B, N, K)
             node_mask = pair_mask.any(dim=2)
         else:
             node_mask = torch.ones(B, N, dtype=torch.bool, device=node_embs.device)
 
         # ----- π(anode | s)，仅对 node 做 mask -----
         node_scores_masked = node_scores.masked_fill(~node_mask, -1e9)
-        log_pi_node = F.log_softmax(node_scores_masked, dim=1)
 
-        # ----- π(alocation | s)，论文无 location mask -----
-        log_pi_loc = F.log_softmax(loc_scores, dim=1)
-
-        # ----- log π(a) = log π(anode) + log π(alocation)，invalid node 已通过 log_pi_node=-inf 排除 -----
-        log_joint = log_pi_node.unsqueeze(2) + log_pi_loc.unsqueeze(1)
-        logits = log_joint.reshape(B, N * K)
-
+        # ----- 返回两个独立分布的参数，不再返回 joint logits -----
         if squeeze_batch:
-            return logits.squeeze(0)
-        return logits
+            return node_scores_masked.squeeze(0), loc_scores.squeeze(0)
+        return node_scores_masked, loc_scores

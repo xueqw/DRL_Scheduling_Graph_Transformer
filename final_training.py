@@ -450,14 +450,11 @@ def make_dto_env_controller(
 def run_rl_episode(env, model: MaskablePPO, deterministic: bool = True):
     """
     评估网络（单 env，obs 来自 env.reset/step）
-    支持 wrapped env，通过 _get_base_env 获取 DTOEnv 的 done/scheduler
     """
-    base_env = _get_base_env(env)
     obs, _ = env.reset()
     steps = 0
-    last_info = None
 
-    while not base_env.done():
+    while not env.done():
         masks = env.action_masks()
         action, _ = model.predict(obs, action_masks=masks, deterministic=deterministic)
 
@@ -465,14 +462,10 @@ def run_rl_episode(env, model: MaskablePPO, deterministic: bool = True):
             action = int(action.item())  # 或 action[0]
 
         obs, reward, terminated, truncated, info = env.step(action)
-        last_info = info
+
         steps += 1
 
-    # 优先从 step_info 获取，避免 auto-reset 导致 download_EAT 被清零
-    if last_info and "step_info" in last_info:
-        ue_finish = list(last_info["step_info"].makespan_by_ue.values())
-    else:
-        ue_finish = list(base_env.scheduler.download_EAT.values())
+    ue_finish = list(env.scheduler.download_EAT.values())
     mean_aft = float(np.mean(ue_finish))
     makespan = float(np.max(ue_finish))
     return mean_aft, makespan, steps
@@ -488,15 +481,12 @@ def _get_base_env(env):
 def run_rl_episode_vec(venv: VecEnv, model: MaskablePPO, deterministic: bool = True):
     """
     评估网络（VecEnv，支持 VecNormalize 归一化）
-    DummyVecEnv 在 done=True 时会自动 reset，download_EAT 被清零，
-    因此从 step 返回的 infos["step_info"].makespan_by_ue 获取结果。
     """
     obs = venv.reset()
     if isinstance(obs, tuple):
         obs = obs[0]
     steps = 0
     dones = [False]
-    last_info = None
 
     while not dones[0]:
         masks = venv.envs[0].action_masks()
@@ -504,16 +494,12 @@ def run_rl_episode_vec(venv: VecEnv, model: MaskablePPO, deterministic: bool = T
         if isinstance(action, np.ndarray):
             action = action.reshape(-1)
         obs, rewards, dones, infos = venv.step(action)
-        last_info = infos[0] if infos else None
         if isinstance(obs, tuple):
             obs = obs[0]
         steps += 1
 
-    if last_info and "step_info" in last_info:
-        ue_finish = list(last_info["step_info"].makespan_by_ue.values())
-    else:
-        base_env = _get_base_env(venv.envs[0])
-        ue_finish = list(base_env.scheduler.download_EAT.values())
+    base_env = _get_base_env(venv.envs[0])
+    ue_finish = list(base_env.scheduler.download_EAT.values())  # DTOEnv.scheduler
     mean_aft = float(np.mean(ue_finish))
     makespan = float(np.max(ue_finish))
     return mean_aft, makespan, steps
@@ -602,15 +588,11 @@ def run_comparison_experiment(
         print(f"  -> 模型已保存: {save_path}")
 
         # 评估（使用 VecNormalize 保持 obs 归一化与训练一致）
-        # 评估 DAG 规模需与训练一致(n_compute_nodes_per_ue=20)，否则 VecNormalize 观测形状不匹配
         mean_aft_list, makespan_list = [], []
-        use_vecnorm = os.path.exists(norm_path)
-        vecnorm_fallback = False  # 若 VecNormalize 评估失败则回退到无归一化
-
         for s in range(n_eval_seeds):
             case = make_dag_case(
                 ue_number=dag_cfg.ue_numbers,
-                n_compute_nodes_per_ue=20,  # 与训练一致，否则 VecNormalize 观测形状不匹配
+                n_compute_nodes_per_ue=50,
                 start_count_max=3,
                 seed=1000 + s,
             )
@@ -628,34 +610,10 @@ def run_comparison_experiment(
             )
             env = ActionMasker(env, lambda e: e.action_masks())
             venv = DummyVecEnv([lambda e=env: e])
-            try:
-                if use_vecnorm and not vecnorm_fallback:
-                    venv = VecNormalize.load(norm_path, venv)
-                    venv.training = False
-                mean_aft, makespan, steps = run_rl_episode_vec(venv, model, deterministic=True)
-                if not np.isfinite(mean_aft) or not np.isfinite(makespan):
-                    raise ValueError(f"NaN/Inf in eval: mean_aft={mean_aft}, makespan={makespan}")
-            except Exception as ex:
-                if use_vecnorm and not vecnorm_fallback:
-                    vecnorm_fallback = True
-                    print(f"  [WARN] VecNormalize 评估异常 ({ex})，回退到无归一化评估")
-                    env_fb = build_env_from_dag_case(
-                        case=case,
-                        ue_number=dag_cfg.ue_numbers,
-                        es_number=dag_cfg.es_numbers,
-                        f_ue=dag_cfg.f_ue,
-                        f_es=dag_cfg.f_es,
-                        es_processors=4,
-                        tr_ue_es=dag_cfg.tr_ue_es,
-                        tr_es_es=dag_cfg.tr_es_es,
-                        reward_oracle=getattr(dag_cfg, "reward_oracle", "local"),
-                        reward_scale=getattr(dag_cfg, "reward_scale", False),
-                    )
-                    env_fb = ActionMasker(env_fb, lambda e: e.action_masks())
-                    venv = DummyVecEnv([lambda e=env_fb: e])
-                    mean_aft, makespan, steps = run_rl_episode_vec(venv, model, deterministic=True)
-                else:
-                    raise
+            if os.path.exists(norm_path):
+                venv = VecNormalize.load(norm_path, venv)
+                venv.training = False
+            mean_aft, makespan, steps = run_rl_episode_vec(venv, model, deterministic=True)
             mean_aft_list.append(mean_aft)
             makespan_list.append(makespan)
 
@@ -767,12 +725,10 @@ def run_reward_comparison_experiment(
         print(f"  -> 模型已保存: {save_path}")
 
         mean_aft_list, makespan_list = [], []
-        use_vecnorm = os.path.exists(norm_path)
-        vecnorm_fallback = False
         for s in range(n_eval_seeds):
             case = make_dag_case(
                 ue_number=cfg.ue_numbers,
-                n_compute_nodes_per_ue=20,  # 与训练一致
+                n_compute_nodes_per_ue=50,
                 start_count_max=3,
                 seed=1000 + s,
             )
@@ -790,34 +746,10 @@ def run_reward_comparison_experiment(
             )
             env = ActionMasker(env, lambda e: e.action_masks())
             venv = DummyVecEnv([lambda e=env: e])
-            try:
-                if use_vecnorm and not vecnorm_fallback:
-                    venv = VecNormalize.load(norm_path, venv)
-                    venv.training = False
-                mean_aft, makespan, _ = run_rl_episode_vec(venv, model, deterministic=True)
-                if not np.isfinite(mean_aft) or not np.isfinite(makespan):
-                    raise ValueError(f"NaN/Inf in eval: mean_aft={mean_aft}, makespan={makespan}")
-            except Exception as ex:
-                if use_vecnorm and not vecnorm_fallback:
-                    vecnorm_fallback = True
-                    print(f"  [WARN] VecNormalize 评估异常 ({ex})，回退到无归一化评估")
-                    env_fb = build_env_from_dag_case(
-                        case=case,
-                        ue_number=cfg.ue_numbers,
-                        es_number=cfg.es_numbers,
-                        f_ue=cfg.f_ue,
-                        f_es=cfg.f_es,
-                        es_processors=4,
-                        tr_ue_es=cfg.tr_ue_es,
-                        tr_es_es=cfg.tr_es_es,
-                        reward_oracle=oracle,
-                        reward_scale=scale,
-                    )
-                    env_fb = ActionMasker(env_fb, lambda e: e.action_masks())
-                    venv = DummyVecEnv([lambda e=env_fb: e])
-                    mean_aft, makespan, _ = run_rl_episode_vec(venv, model, deterministic=True)
-                else:
-                    raise
+            if os.path.exists(norm_path):
+                venv = VecNormalize.load(norm_path, venv)
+                venv.training = False
+            mean_aft, makespan, _ = run_rl_episode_vec(venv, model, deterministic=True)
             mean_aft_list.append(mean_aft)
             makespan_list.append(makespan)
 

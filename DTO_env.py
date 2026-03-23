@@ -4,7 +4,7 @@ from typing import Set, Dict, List, Tuple, Optional
 import numpy as np
 from gensim.models import FastText
 
-from DTO_scheduler import Node
+from GNNDAG.DTO_scheduler import Node
 import gymnasium as gym
 from gymnasium import spaces
 
@@ -197,17 +197,17 @@ class DTOEnv(gym.Env):
             "nodes_ava": np.asarray(ava, dtype=np.int8),
 
             # ===== locations =====
-            "loc_cpu_speed": np.asarray(cpu_speed, dtype=np.float32),
-            "loc_min_processor_EAT": np.asarray(min_processor_EAT, dtype=np.float32),
-            "loc_num_processor": np.asarray(num_processor, dtype=np.int64),
+            "loc_cpu_speed": cpu_speed,  # shape (L,), float32
+            "loc_min_processor_EAT": min_processor_EAT,  # shape (L,), float32
+            "loc_num_processor": num_processor,  # shape (L,), int64
 
             # ===== ue =====
-            "ue_upload_EAT": np.asarray(upload_EAT, dtype=np.float32),
-            "ue_download_EAT": np.asarray(download_EAT, dtype=np.float32),
+            "ue_upload_EAT": upload_EAT,  # shape (UE,), float32
+            "ue_download_EAT": download_EAT,  # shape (UE,), float32
 
-            # 图结构特征（edge_attr 在 env 侧做 log1p，避免 VecNormalize 后再 log1p 产生 NaN）
+            # 图结构特征
             "adj": self.adj,
-            "edge_attr": np.log1p(np.asarray(self.edge_attr, dtype=np.float64)).astype(np.float32),
+            "edge_attr": self.edge_attr,
         }
 
         return observation
