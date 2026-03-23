@@ -84,12 +84,14 @@ class DTODRLMaskablePolicy(MaskableActorCriticPolicy):
         if use_transformer_backbone:
             # 横向对比: 与 Joint/Two-Stage 共用 TransformerConv + 3D location
             hidden = kwargs.get("hidden_dim", 108)
+            use_cp = kwargs.get("use_cp", False)
             self.backbone = GraphBackbone(
                 node_feature_dim=6,
                 location_feature_dim=3,
                 hidden_dim=hidden,
                 gat_heads=kwargs.get("gat_heads", 4),
                 gat_layers=kwargs.get("gat_layers", 3),
+                use_cp=use_cp,
             )
             backbone_hidden = hidden
             pretrained_gat_path = None

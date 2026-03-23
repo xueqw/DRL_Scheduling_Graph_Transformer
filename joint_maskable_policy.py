@@ -73,6 +73,7 @@ class JointMaskablePolicy(MaskableActorCriticPolicy):
             hidden_dim=hidden_dim,
             gat_heads=gat_heads,
             gat_layers=gat_layers,
+            use_cp=kwargs.get("use_cp", False),
         )
 
         self.actor = JointActor(hidden_dim=hidden_dim)

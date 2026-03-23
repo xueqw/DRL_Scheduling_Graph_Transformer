@@ -8,6 +8,8 @@ from GNNDAG.DTO_scheduler import Node
 import gymnasium as gym
 from gymnasium import spaces
 
+from cp_utils import compute_cp, normalize_cp
+
 @dataclass
 class StepInfo:
     # 用于日志和调试
@@ -78,6 +80,8 @@ class DTOEnv(gym.Env):
             "adj": spaces.Box(0, 1, shape=(self.N, self.N), dtype=np.int8),
             # ---- edge ----
             "edge_attr": spaces.Box(0, np.inf, shape=(self.N, self.N), dtype=np.float32),
+            # ---- Critical Path 归一化特征 ----
+            "nodes_cp": spaces.Box(0, 1, shape=(self.N,), dtype=np.float32),
         })
 
         self.prev_mean_eft = 0.0
@@ -208,6 +212,8 @@ class DTOEnv(gym.Env):
             # 图结构特征
             "adj": self.adj,
             "edge_attr": self.edge_attr,
+            # Critical Path 归一化
+            "nodes_cp": self.nodes_cp,
         }
 
         return observation
@@ -294,6 +300,19 @@ class DTOEnv(gym.Env):
 
         self.adj = adj
         self.edge_attr = edge_attr
+
+        # Critical Path 计算并归一化 (CP/max_CP)
+        cp_raw = compute_cp(
+            node_ids=self.node_ids,
+            id2idx=self.id2idx,
+            nodes=scheduler.nodes,
+            edges_data=scheduler.edges_data,
+            locations=scheduler.locations,
+            exec_model=scheduler.exec_model,
+            trans_model=scheduler.trans_model,
+        )
+        cp_norm = normalize_cp(cp_raw, method="max")
+        self.nodes_cp = np.asarray([cp_norm.get(i, 0.0) for i in range(self.N)], dtype=np.float32)
 
         observation = self.build_obs(scheduler.nodes)
 

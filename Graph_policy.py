@@ -1,4 +1,5 @@
 # Graph_policy.py
+import math
 from typing import Tuple, Optional
 
 import torch
@@ -12,6 +13,7 @@ from sb3_contrib.common.maskable.policies import MaskableActorCriticPolicy
 from torch_geometric.nn import GATConv, global_mean_pool
 from torch_geometric.utils import add_self_loops
 from torch_geometric.nn import TransformerConv
+from torch_geometric.utils import softmax
 
 # ----------------------------
 # Utils: adj -> edge_index
@@ -82,6 +84,88 @@ def build_graph_inputs_from_adj(
 
 from torch_geometric.nn import TransformerConv, global_mean_pool
 
+
+class CPTransformerConv(TransformerConv):
+    """
+    在 attention 中加入 CP bias: α_ij = softmax((QK^T)/√d + λ·CP_norm(j))
+    """
+
+    def __init__(self, *args, cp_lambda: float = 1.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cp_lambda = nn.Parameter(torch.tensor(cp_lambda, dtype=torch.float32))
+
+    def forward(
+        self,
+        x,
+        edge_index,
+        edge_attr=None,
+        cp_norm: Optional[Tensor] = None,
+        return_attention_weights=None,
+    ):
+        H, C = self.heads, self.out_channels
+        if isinstance(x, Tensor):
+            x = (x, x)
+        query = self.lin_query(x[1]).view(-1, H, C)
+        key = self.lin_key(x[0]).view(-1, H, C)
+        value = self.lin_value(x[0]).view(-1, H, C)
+        kwargs = {"query": query, "key": key, "value": value, "edge_attr": edge_attr}
+        if cp_norm is not None:
+            kwargs["cp_norm"] = cp_norm
+            kwargs["target_index"] = edge_index[1]
+        out = self.propagate(edge_index, **kwargs)
+        alpha = self._alpha
+        self._alpha = None
+        if self.concat:
+            out = out.view(-1, self.heads * self.out_channels)
+        else:
+            out = out.mean(dim=1)
+        if self.root_weight:
+            x_r = self.lin_skip(x[1])
+            if self.lin_beta is not None:
+                beta = self.lin_beta(torch.cat([out, x_r, out - x_r], dim=-1)).sigmoid()
+                out = beta * x_r + (1 - beta) * out
+            else:
+                out = out + x_r
+        if isinstance(return_attention_weights, bool) and alpha is not None:
+            if isinstance(edge_index, Tensor):
+                return out, (edge_index, alpha)
+        return out
+
+    def message(
+        self,
+        query_i: Tensor,
+        key_j: Tensor,
+        value_j: Tensor,
+        edge_attr: Optional[Tensor],
+        index: Tensor,
+        ptr: Optional[Tensor],
+        size_i: Optional[int],
+        cp_norm: Optional[Tensor] = None,
+        target_index: Optional[Tensor] = None,
+    ) -> Tensor:
+        if self.lin_edge is not None and edge_attr is not None:
+            edge_attr = self.lin_edge(edge_attr).view(-1, self.heads, self.out_channels)
+            key_j = key_j + edge_attr
+        alpha = (query_i * key_j).sum(dim=-1) / math.sqrt(self.out_channels)
+        if cp_norm is not None and target_index is not None:
+            cp_bias = self.cp_lambda * cp_norm[target_index]
+            alpha = alpha + cp_bias
+        alpha = softmax(alpha, index, ptr, size_i)
+        self._alpha = alpha
+        alpha = F.dropout(alpha, p=self.dropout, training=self.training)
+        out = value_j
+        if edge_attr is not None:
+            out = out + edge_attr
+        out = out * alpha.view(-1, self.heads, 1)
+        return out
+
+
+def _make_conv_layer(use_cp: bool, **kwargs) -> nn.Module:
+    if use_cp:
+        return CPTransformerConv(**kwargs, cp_lambda=1.0)
+    return TransformerConv(**kwargs)
+
+
 class NodeEncoder(nn.Module):
     def __init__(
         self,
@@ -89,18 +173,18 @@ class NodeEncoder(nn.Module):
         hidden_dim: int,
         heads: int,
         edge_dim: int = 1,
-        num_layers: int = 3
+        num_layers: int = 3,
+        use_cp: bool = False,
     ):
         super().__init__()
-
+        self.use_cp = use_cp
         assert hidden_dim % heads == 0, "hidden_dim must be divisible by heads"
         out_per_head = hidden_dim // heads
-
         self.layers = nn.ModuleList()
 
-        # 第一层
         self.layers.append(
-            TransformerConv(
+            _make_conv_layer(
+                use_cp,
                 in_channels=in_dim,
                 out_channels=out_per_head,
                 heads=heads,
@@ -110,11 +194,10 @@ class NodeEncoder(nn.Module):
                 concat=True,
             )
         )
-
-        # 中间层
         for _ in range(num_layers - 2):
             self.layers.append(
-                TransformerConv(
+                _make_conv_layer(
+                    use_cp,
                     in_channels=hidden_dim,
                     out_channels=out_per_head,
                     heads=heads,
@@ -124,11 +207,10 @@ class NodeEncoder(nn.Module):
                     concat=True,
                 )
             )
-
-        # 最后一层
         if num_layers > 1:
             self.layers.append(
-                TransformerConv(
+                _make_conv_layer(
+                    use_cp,
                     in_channels=hidden_dim,
                     out_channels=hidden_dim,
                     heads=1,
@@ -138,7 +220,6 @@ class NodeEncoder(nn.Module):
                     concat=True,
                 )
             )
-
         self.layer_norm = nn.LayerNorm(hidden_dim)
 
     def forward(
@@ -147,25 +228,23 @@ class NodeEncoder(nn.Module):
         edge_index: Tensor,
         edge_attr: Tensor,
         batch: Optional[Tensor] = None,
-        pool: bool = True
+        pool: bool = True,
+        cp_norm: Optional[Tensor] = None,
     ) -> Tensor:
         x = node_features
-
         for i, conv in enumerate(self.layers):
-            x = conv(x, edge_index, edge_attr=edge_attr)
+            if self.use_cp and cp_norm is not None and isinstance(conv, CPTransformerConv):
+                x = conv(x, edge_index, edge_attr=edge_attr, cp_norm=cp_norm)
+            else:
+                x = conv(x, edge_index, edge_attr=edge_attr)
             if i < len(self.layers) - 1:
                 x = F.relu(x)
-
         x = self.layer_norm(x)
-
-        # 全局就上pool 走全局平均池化
-        # two-stage 直接返回embedding
         if pool:
             if batch is not None:
                 x = global_mean_pool(x, batch)
             else:
                 x = x.mean(dim=0, keepdim=True)
-
         return x
 
 
@@ -288,8 +367,7 @@ class GraphDictFeaturesExtractor(BaseFeaturesExtractor):
 class GraphBackbone(nn.Module):
     """
     灵活化接口
-    能直接抽节点的embedding
-    节点特征按论文 6 维: Ci, Di, in_degree, out_degree, loci, avai
+    节点特征: 论文 6 维 + 可选 CP 维 (use_cp 时 7 维)
     """
     def __init__(
             self,
@@ -298,14 +376,18 @@ class GraphBackbone(nn.Module):
             hidden_dim: int = 108,
             gat_heads: int = 4,
             gat_layers: int = 3,
+            use_cp: bool = False,
     ):
         super().__init__()
+        self.use_cp = use_cp
+        in_dim = node_feature_dim + (1 if use_cp else 0)
 
         self.node_encoder = NodeEncoder(
-            in_dim=node_feature_dim,
+            in_dim=in_dim,
             hidden_dim=hidden_dim,
             heads=gat_heads,
             num_layers=gat_layers,
+            use_cp=use_cp,
         )
 
         self.location_encoder = LocationEncoder(
@@ -323,7 +405,7 @@ class GraphBackbone(nn.Module):
     def encode_nodes(self, obs):
         device = obs["nodes_C"].device
 
-        # 论文 6 维: Ci, Di, in_degree, out_degree, loci, avai
+        # 论文 6 维: Ci, Di, in_degree, out_degree, loci, avai [+ nodes_cp]
         node_features = torch.stack([
             obs["nodes_C"].float(),
             obs["nodes_D"].float(),
@@ -332,6 +414,11 @@ class GraphBackbone(nn.Module):
             obs["nodes_loc"].float(),
             obs["nodes_ava"].float(),
         ], dim=-1)
+        if self.use_cp and "nodes_cp" in obs:
+            cp = obs["nodes_cp"].float()
+            if cp.dim() == 1:
+                cp = cp.unsqueeze(-1)
+            node_features = torch.cat([node_features, cp], dim=-1)
 
         adj = obs["adj"]
         edge_attr_matrix = obs["edge_attr"]
@@ -340,22 +427,25 @@ class GraphBackbone(nn.Module):
             adj, edge_attr_matrix
         )
 
-        # 节点输入特征
         if node_features.dim() == 3:
             B, N, Fdim = node_features.shape
             node_features = node_features.reshape(B * N, Fdim)
 
-        # 数据压缩
-        # 边特征
         edge_attr = torch.log1p(edge_attr)
 
-        # 保持节点embedding 不走平均池化 方便做出节点选择
+        cp_norm = None
+        if self.use_cp and "nodes_cp" in obs:
+            cp_norm = obs["nodes_cp"].float().to(device)
+            if cp_norm.dim() == 2:
+                cp_norm = cp_norm.reshape(-1)
+
         node_embs = self.node_encoder(
             node_features=node_features.to(device),
             edge_index=edge_index.to(device),
             edge_attr=edge_attr.to(device),
             batch=batch,
             pool=False,
+            cp_norm=cp_norm,
         )
 
         return node_embs, batch

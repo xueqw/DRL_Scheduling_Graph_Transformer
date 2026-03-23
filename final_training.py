@@ -78,6 +78,9 @@ class TrainConfig:
     dtodrl_pretrained_gat: Optional[str] = None
     dtodrl_freeze_pretrained_gat: bool = True
 
+    # Critical Path 特征: GraphBackbone 使用 CP 归一化 + attention bias
+    use_cp: bool = False
+
 @dataclass
 class DAGConfig:
     """
@@ -183,6 +186,7 @@ class DTODRLTrainer:
                 hidden_dim=self.config.features_dim,
                 gat_heads=4,
                 gat_layers=3,
+                use_cp=self.config.use_cp,
             )
             self.model = MaskablePPO(
                 policy=JointMaskablePolicy,
@@ -240,6 +244,7 @@ class DTODRLTrainer:
                 mlp_hidden=256,
                 max_K=16,
                 max_N=200,
+                use_cp=self.config.use_cp,
             )
             self.model = MaskablePPO(
                 policy=DTODRLMaskablePolicy,
@@ -265,6 +270,7 @@ class DTODRLTrainer:
                 hidden_dim=self.config.features_dim,
                 gat_heads=4,
                 gat_layers=3,
+                use_cp=self.config.use_cp,
             )
             self.model = MaskablePPO(
                 policy=TwoStageMaskablePolicy,
