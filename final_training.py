@@ -62,7 +62,7 @@ class TrainConfig:
     total_timesteps: int = 200_000
     learning_rate: float = 3e-4
     n_steps: int = 2048
-    batch_size: int = 256
+    batch_size: int = 512
     gamma: float = 0.99
     # 限制新旧策略差距
     clip_range: float = 0.2
@@ -80,6 +80,7 @@ class TrainConfig:
 
     # Critical Path 特征: GraphBackbone 使用 CP 归一化 + attention bias
     use_cp: bool = False
+    use_vecnormalize: bool = False
 
 @dataclass
 class DAGConfig:
@@ -169,9 +170,15 @@ class DTODRLTrainer:
             use_subprocess=False,
         )
 
-        self.vec_env = VecNormalize(self.vec_env, norm_obs=True, norm_reward=False, clip_obs=10.0)
-        self.evaluation_vec_env = VecNormalize(self.evaluation_vec_env, training=False, norm_obs=True,
-                                               norm_reward=False, clip_obs=10.0)
+        if self.config.use_vecnormalize:
+            self.vec_env = VecNormalize(self.vec_env, norm_obs=True, norm_reward=False, clip_obs=10.0)
+            self.evaluation_vec_env = VecNormalize(
+                self.evaluation_vec_env,
+                training=False,
+                norm_obs=True,
+                norm_reward=False,
+                clip_obs=10.0,
+            )
 
     def build_model(self, model_type: str = "joint"):
         """
@@ -212,8 +219,6 @@ class DTODRLTrainer:
                 gat_heads=3,
                 gat_layers=3,
                 mlp_hidden=256,
-                max_K=16,
-                max_N=200,
                 pretrained_gat_path=self.config.dtodrl_pretrained_gat,
                 freeze_pretrained_gat=self.config.dtodrl_freeze_pretrained_gat,
             )
@@ -242,8 +247,6 @@ class DTODRLTrainer:
                 gat_heads=4,
                 gat_layers=3,
                 mlp_hidden=256,
-                max_K=16,
-                max_N=200,
                 use_cp=self.config.use_cp,
             )
             self.model = MaskablePPO(
@@ -338,7 +341,8 @@ class DTODRLTrainer:
         self.model.save(save_path)
         # 保存 VecNormalize，评估时需加载以保持 obs 归一化一致
         norm_path = os.path.join(self.run_dic, "vecnormalize.pkl")
-        self.vec_env.save(norm_path)
+        if isinstance(self.vec_env, VecNormalize):
+            self.vec_env.save(norm_path)
 
         return save_path
 
@@ -937,5 +941,3 @@ if __name__ == "__main__":
     # summarize("RL(PPO+GAT)", rl_result)
     # for rule in ["topo", "sjf", "ljf"]:
     #     summarize(f"baseline-{rule}", baseline_result[rule])
-
-

@@ -201,13 +201,13 @@ class DTOEnv(gym.Env):
             "nodes_ava": np.asarray(ava, dtype=np.int8),
 
             # ===== locations =====
-            "loc_cpu_speed": cpu_speed,  # shape (L,), float32
-            "loc_min_processor_EAT": min_processor_EAT,  # shape (L,), float32
-            "loc_num_processor": num_processor,  # shape (L,), int64
+            "loc_cpu_speed": np.asarray(cpu_speed, dtype=np.float32),
+            "loc_min_processor_EAT": np.asarray(min_processor_EAT, dtype=np.float32),
+            "loc_num_processor": np.asarray(num_processor, dtype=np.int64),
 
             # ===== ue =====
-            "ue_upload_EAT": upload_EAT,  # shape (UE,), float32
-            "ue_download_EAT": download_EAT,  # shape (UE,), float32
+            "ue_upload_EAT": np.asarray(upload_EAT, dtype=np.float32),
+            "ue_download_EAT": np.asarray(download_EAT, dtype=np.float32),
 
             # 图结构特征
             "adj": self.adj,

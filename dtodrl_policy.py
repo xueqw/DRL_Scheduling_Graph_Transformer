@@ -1,39 +1,26 @@
 """
-DTODRL 论文原方法 Baseline
-
-论文: Dependent Task Offloading in Edge Computing Using GNN and Deep Reinforcement Learning
-(Cao & Deng, arXiv:2303.17100)
-
-与论文完全一致:
-- Node Head: 统一 state 向量 → 一次输出 N 维 logits
-- Location Head: loc_head(state)，与 Node Head 共享同一 state
-- 仅 node mask，无 pair mask
-- State = flatten(concat(stask, slocations))，先 concat 再展平
-- 两个独立 Categorical: dist_node, dist_loc，采样 node ~ dist_node, loc ~ dist_loc，action = node*K+loc
+DTODRL paper-aligned actor/distribution helpers.
 """
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from typing import Optional, Tuple
 
+import torch
+import torch.nn as nn
 from sb3_contrib.common.maskable.distributions import MaskableDistribution
 from torch.distributions import Categorical
 
 
 class TwoHeadMaskableCategoricalDistribution(MaskableDistribution):
     """
-    两个独立 Categorical: dist_node, dist_loc
+    Two independent categorical distributions:
     - dist_node = Categorical(logits=node_scores_masked)
     - dist_loc = Categorical(logits=loc_scores)
-    - 采样: node ~ dist_node, loc ~ dist_loc, action = node*K + loc
-    - log_prob(a) = log_prob_node(a_node) + log_prob_loc(a_loc)
+    - sample action as node * K + loc
     """
 
     def __init__(self):
         super().__init__()
 
     def proba_distribution_net(self, latent_dim: int) -> nn.Module:
-        """不使用，logits 由 Actor 直接输出"""
         return nn.Identity()
 
     def proba_distribution(
@@ -68,101 +55,111 @@ class TwoHeadMaskableCategoricalDistribution(MaskableDistribution):
         return self.dist_node.entropy() + self.dist_loc.entropy()
 
     def apply_masking(self, masks=None) -> None:
-        """node mask 已在 Actor 中融入 node_scores_masked，此处无需再处理"""
+        # The DTODRL paper applies a mask only on the node head.
         pass
 
 
 class DTODRLActor(nn.Module):
     """
-    论文 DTODRL Actor: 统一 state → Node Head(N 维) + Location Head(K 维)
-    - Node Head: loc_head(state) → N logits
-    - Location Head: loc_head(state) → K logits（与 Node Head 共享同一 state）
-    - 仅 node mask，无 pair mask
+    Paper-aligned DTODRL actor:
+    state = concat(flatten(stask), flatten(slocations))
+    Node Head and Location Head share the same state.
     """
 
     def __init__(
         self,
         hidden_dim: int,
+        num_nodes: int,
+        num_locations: int,
+        num_user_locations: int,
         mlp_hidden: int = 256,
-        max_N: int = 200,
-        max_K: int = 16,
     ):
         super().__init__()
-        self.max_N = max_N
-        self.max_K = max_K
-        # Node Head: 论文 统一 state → N 维, state = flatten(concat(stask, slocations))
-        # in = max_N*d + max_K*d
+        self.num_nodes = num_nodes
+        self.num_locations = num_locations
+        self.num_user_locations = num_user_locations
+        self.num_action_locations = num_locations - num_user_locations + 1
+
+        state_dim = (num_nodes + num_locations) * hidden_dim
+
         self.node_head = nn.Sequential(
-            nn.Linear(max_N * hidden_dim + max_K * hidden_dim, mlp_hidden),
+            nn.Linear(state_dim, mlp_hidden),
             nn.Tanh(),
-            nn.Dropout(0.1),
-            nn.Linear(mlp_hidden, max_N),
+            nn.Linear(mlp_hidden, num_nodes),
         )
-        # Location Head: 论文 loc_logits = loc_head(state)，与 Node Head 共享同一 state
-        # in = max_N*d + max_K*d（与 node_head 相同）
         self.loc_head = nn.Sequential(
-            nn.Linear(max_N * hidden_dim + max_K * hidden_dim, mlp_hidden),
+            nn.Linear(state_dim, mlp_hidden),
             nn.Tanh(),
-            nn.Dropout(0.1),
-            nn.Linear(mlp_hidden, max_K),
+            nn.Linear(mlp_hidden, self.num_action_locations),
         )
 
     def forward(
         self,
         node_embs: torch.Tensor,
-        loc_K_embs: torch.Tensor,
+        loc_all_embs: torch.Tensor,
         action_masks: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        node_embs: (B, N, d)
-        loc_K_embs: (B, K, d) 论文 slocations 的 K 个位置 embedding
-        Returns:
-            node_scores_masked: (B, N) 已做 node mask
-            loc_scores: (B, K)
-        """
         squeeze_batch = False
         if node_embs.dim() == 2:
             node_embs = node_embs.unsqueeze(0)
-            loc_K_embs = loc_K_embs.unsqueeze(0)
+            loc_all_embs = loc_all_embs.unsqueeze(0)
             squeeze_batch = True
 
-        B, N, d = node_embs.shape
-        _, K, _ = loc_K_embs.shape
+        bsz, num_nodes, _ = node_embs.shape
+        _, num_locations, _ = loc_all_embs.shape
+        num_action_locations = self.num_action_locations
 
-        if N > self.max_N or K > self.max_K:
-            raise ValueError(f"N={N} K={K} exceeds max_N={self.max_N} max_K={self.max_K}")
+        if num_nodes != self.num_nodes or num_locations != self.num_locations:
+            raise ValueError(
+                f"Unexpected DTODRL state shape: nodes={num_nodes}/{self.num_nodes}, "
+                f"locations={num_locations}/{self.num_locations}"
+            )
 
-        # ----- 论文 logits 分离: h = f(s), state = flatten(concat(stask, slocations))，先 concat 再展平 -----
-        # Pad to max dims
-        if N < self.max_N:
-            node_embs = F.pad(node_embs, (0, 0, 0, self.max_N - N), value=0)  # (B, max_N, d)
-        if K < self.max_K:
-            loc_K_embs = F.pad(loc_K_embs, (0, 0, 0, self.max_K - K), value=0)  # (B, max_K, d)
-        # 先 concat 再 flatten
-        state_seq = torch.cat([node_embs, loc_K_embs], dim=1)  # (B, max_N+max_K, d)
-        state = state_seq.reshape(B, -1)  # (B, (max_N+max_K)*d) = (B, max_N*d + max_K*d)
+        state = torch.cat(
+            [node_embs.reshape(bsz, -1), loc_all_embs.reshape(bsz, -1)],
+            dim=1,
+        )
 
-        # ----- Node Head: 统一 state → N 维 logits -----
-        node_scores_full = self.node_head(state)  # (B, max_N)
-        node_scores = node_scores_full[:, :N]     # (B, N)
+        node_scores = self.node_head(state)
+        loc_scores = self.loc_head(state)
 
-        # ----- Location Head: 论文 loc_logits = loc_head(state) -----
-        loc_scores_full = self.loc_head(state)  # (B, max_K)
-        loc_scores = loc_scores_full[:, :K]        # (B, K)
-
-        # ----- 论文仅 node mask，无 pair mask -----
         if action_masks is not None:
             if action_masks.dim() == 1:
                 action_masks = action_masks.unsqueeze(0)
-            pair_mask = action_masks.reshape(B, N, K)
+            pair_mask = action_masks.reshape(bsz, num_nodes, num_action_locations)
             node_mask = pair_mask.any(dim=2)
         else:
-            node_mask = torch.ones(B, N, dtype=torch.bool, device=node_embs.device)
+            node_mask = torch.ones(bsz, num_nodes, dtype=torch.bool, device=node_embs.device)
 
-        # ----- π(anode | s)，仅对 node 做 mask -----
         node_scores_masked = node_scores.masked_fill(~node_mask, -1e9)
 
-        # ----- 返回两个独立分布的参数，不再返回 joint logits -----
         if squeeze_batch:
             return node_scores_masked.squeeze(0), loc_scores.squeeze(0)
         return node_scores_masked, loc_scores
+
+
+class DTODRLCritic(nn.Module):
+    """Use Tanh to match the paper's PPO activation setting."""
+
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.value_net = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, graph_emb: torch.Tensor, loc_global_emb: torch.Tensor) -> torch.Tensor:
+        if graph_emb.dim() != 2 or loc_global_emb.dim() != 2:
+            raise ValueError(
+                f"graph_emb and loc_global_emb must be 2D, got "
+                f"{tuple(graph_emb.shape)} and {tuple(loc_global_emb.shape)}"
+            )
+        if graph_emb.shape != loc_global_emb.shape:
+            raise ValueError(
+                f"shape mismatch: graph_emb={tuple(graph_emb.shape)}, "
+                f"loc_global_emb={tuple(loc_global_emb.shape)}"
+            )
+
+        x = torch.cat([graph_emb, loc_global_emb], dim=-1)
+        return self.value_net(x).squeeze(-1)

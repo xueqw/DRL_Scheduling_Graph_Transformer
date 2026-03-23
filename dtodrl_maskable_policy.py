@@ -1,22 +1,17 @@
 """
-DTODRL 论文原方法 Maskable Policy
-
-论文方法: Node Head + Location Head 独立双头，P(a)=P(node)×P(loc)
-与原文完全一致: GAT(128,3头), Location(EFT,f)两维, MLP 256, Tanh
+DTODRL paper-aligned maskable PPO policy.
 """
-from typing import Optional, Tuple, Dict
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from gymnasium import spaces
-
-from stable_baselines3.common.type_aliases import PyTorchObs, Schedule
 from sb3_contrib.common.maskable.policies import MaskableActorCriticPolicy
+from stable_baselines3.common.type_aliases import PyTorchObs, Schedule
 
 from dtodrl_backbone import DTODRLBackbone
 from Graph_policy import GraphBackbone
-from joint_policy import JointCritic
-from dtodrl_policy import DTODRLActor, TwoHeadMaskableCategoricalDistribution
+from dtodrl_policy import DTODRLActor, DTODRLCritic, TwoHeadMaskableCategoricalDistribution
 
 
 class _IdentityExtractor(nn.Module):
@@ -47,8 +42,8 @@ class _DummyMlpExtractor(nn.Module):
 
 class DTODRLMaskablePolicy(MaskableActorCriticPolicy):
     """
-    DTODRL 论文原方法: 双头独立 (Node Head + Location Head)
-    P(anode, alocation) = P(anode) × P(alocation)
+    DTODRL with two independent heads:
+    P(a_node, a_location) = P(a_node) * P(a_location)
     """
 
     def __init__(
@@ -60,14 +55,12 @@ class DTODRLMaskablePolicy(MaskableActorCriticPolicy):
         gat_heads: int = 3,
         gat_layers: int = 3,
         mlp_hidden: int = 256,
-        max_K: int = 16,
-        max_N: int = 200,
         pretrained_gat_path: Optional[str] = None,
         freeze_pretrained_gat: bool = True,
         use_transformer_backbone: bool = False,
+        hidden_dim: int = 108,
         **kwargs,
     ):
-        self.dtodrl_max_N = max_N
         super().__init__(
             observation_space,
             action_space,
@@ -82,21 +75,16 @@ class DTODRLMaskablePolicy(MaskableActorCriticPolicy):
         self.mlp_extractor = _DummyMlpExtractor()
 
         if use_transformer_backbone:
-            # 横向对比: 与 Joint/Two-Stage 共用 TransformerConv + 3D location
-            hidden = kwargs.get("hidden_dim", 108)
-            use_cp = kwargs.get("use_cp", False)
             self.backbone = GraphBackbone(
                 node_feature_dim=6,
                 location_feature_dim=3,
-                hidden_dim=hidden,
+                hidden_dim=hidden_dim,
                 gat_heads=kwargs.get("gat_heads", 4),
                 gat_layers=kwargs.get("gat_layers", 3),
-                use_cp=use_cp,
+                use_cp=kwargs.get("use_cp", False),
             )
-            backbone_hidden = hidden
-            pretrained_gat_path = None
+            actor_hidden_dim = hidden_dim
         else:
-            # 论文原方法: GAT + 2D location
             self.backbone = DTODRLBackbone(
                 node_feature_dim=6,
                 location_feature_dim=2,
@@ -105,15 +93,16 @@ class DTODRLMaskablePolicy(MaskableActorCriticPolicy):
                 gat_layers=gat_layers,
                 mlp_hidden=mlp_hidden,
             )
-            backbone_hidden = gat_hidden
+            actor_hidden_dim = gat_hidden
 
         self.actor = DTODRLActor(
-            hidden_dim=backbone_hidden,
+            hidden_dim=actor_hidden_dim,
+            num_nodes=observation_space["nodes_C"].shape[0],
+            num_locations=observation_space["loc_cpu_speed"].shape[0],
+            num_user_locations=observation_space["ue_upload_EAT"].shape[0],
             mlp_hidden=mlp_hidden,
-            max_N=getattr(self, "dtodrl_max_N", 200),
-            max_K=max_K,
         )
-        self.critic = JointCritic(hidden_dim=backbone_hidden)
+        self.critic = DTODRLCritic(hidden_dim=actor_hidden_dim)
 
         if pretrained_gat_path and not use_transformer_backbone:
             state = torch.load(pretrained_gat_path, map_location="cpu")
@@ -121,8 +110,8 @@ class DTODRLMaskablePolicy(MaskableActorCriticPolicy):
                 state = state["encoder"]
             self.backbone.gat_encoder.load_state_dict(state, strict=False)
             if freeze_pretrained_gat:
-                for p in self.backbone.gat_encoder.parameters():
-                    p.requires_grad = False
+                for param in self.backbone.gat_encoder.parameters():
+                    param.requires_grad = False
 
         self.action_net = nn.Identity()
         self.value_net = nn.Identity()
@@ -140,12 +129,12 @@ class DTODRLMaskablePolicy(MaskableActorCriticPolicy):
         if not isinstance(obs, dict):
             raise ValueError(f"Policy expects dict obs, got {type(obs)}")
         out = {}
-        for k, v in obs.items():
-            if not torch.is_tensor(v):
-                v = torch.as_tensor(v, device=self.device)
+        for key, value in obs.items():
+            if not torch.is_tensor(value):
+                value = torch.as_tensor(value, device=self.device)
             else:
-                v = v.to(self.device)
-            out[k] = v
+                value = value.to(self.device)
+            out[key] = value
         return out
 
     def _reshape_node_embs(
@@ -156,14 +145,24 @@ class DTODRLMaskablePolicy(MaskableActorCriticPolicy):
     ) -> torch.Tensor:
         if obs["nodes_C"].dim() == 1:
             return node_embs.unsqueeze(0)
-        elif obs["nodes_C"].dim() == 2:
-            B, N = obs["nodes_C"].shape
-            BN, d = node_embs.shape
-            if BN != B * N:
-                raise ValueError(f"node_embs first dim mismatch: {BN} vs {B*N}")
-            return node_embs.reshape(B, N, d)
-        else:
-            raise ValueError(f"Unexpected obs['nodes_C'] shape: {tuple(obs['nodes_C'].shape)}")
+        if obs["nodes_C"].dim() == 2:
+            batch_size, num_nodes = obs["nodes_C"].shape
+            flat_nodes, hidden_dim = node_embs.shape
+            if flat_nodes != batch_size * num_nodes:
+                raise ValueError(f"node_embs first dim mismatch: {flat_nodes} vs {batch_size * num_nodes}")
+            return node_embs.reshape(batch_size, num_nodes, hidden_dim)
+        raise ValueError(f"Unexpected obs['nodes_C'] shape: {tuple(obs['nodes_C'].shape)}")
+
+    def _reshape_location_embs(
+        self,
+        loc_embs: torch.Tensor,
+        obs: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        if obs["loc_cpu_speed"].dim() == 1:
+            return loc_embs.unsqueeze(0)
+        if obs["loc_cpu_speed"].dim() == 2:
+            return loc_embs
+        raise ValueError(f"Unexpected obs['loc_cpu_speed'] shape: {tuple(obs['loc_cpu_speed'].shape)}")
 
     def _extract_joint_latents(
         self, obs: PyTorchObs
@@ -175,33 +174,30 @@ class DTODRLMaskablePolicy(MaskableActorCriticPolicy):
         loc_global_emb = self.backbone.pool_locations(loc_embs_raw)
 
         node_embs = self._reshape_node_embs(node_embs_raw, obs, batch=batch)
-        candidate_loc_embs = self._build_candidate_loc_embs(obs, loc_embs_raw)
-        loc_K_embs = self._build_loc_K_embs_for_dtodrl(obs, loc_embs_raw)
+        loc_embs = self._reshape_location_embs(loc_embs_raw, obs)
 
         if graph_emb.dim() == 1:
             graph_emb = graph_emb.unsqueeze(0)
         if loc_global_emb.dim() == 1:
             loc_global_emb = loc_global_emb.unsqueeze(0)
 
-        return node_embs, candidate_loc_embs, graph_emb, loc_global_emb, loc_K_embs
+        return node_embs, loc_embs, graph_emb, loc_global_emb
 
     def _get_action_logits(
         self, obs: PyTorchObs, action_masks: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """返回 (node_scores_masked, loc_scores) 供双分布使用"""
-        node_embs, _, graph_emb, loc_global_emb, loc_K_embs = self._extract_joint_latents(obs)
-
+        node_embs, loc_embs, _, _ = self._extract_joint_latents(obs)
         if action_masks is not None and not torch.is_tensor(action_masks):
             action_masks = torch.as_tensor(action_masks, dtype=torch.bool, device=self.device)
 
         return self.actor(
             node_embs=node_embs,
-            loc_K_embs=loc_K_embs,
+            loc_all_embs=loc_embs,
             action_masks=action_masks,
         )
 
     def _get_values(self, obs: PyTorchObs) -> torch.Tensor:
-        _, _, graph_emb, loc_global_emb, _ = self._extract_joint_latents(obs)
+        _, _, graph_emb, loc_global_emb = self._extract_joint_latents(obs)
         return self.critic(graph_emb, loc_global_emb)
 
     def forward(
@@ -214,14 +210,14 @@ class DTODRLMaskablePolicy(MaskableActorCriticPolicy):
         values = self._get_values(obs)
 
         distribution = self.action_dist.proba_distribution(
-            node_scores_masked=node_scores_masked, loc_scores=loc_scores
+            node_scores_masked=node_scores_masked,
+            loc_scores=loc_scores,
         )
         if action_masks is not None:
             distribution.apply_masking(action_masks)
 
         actions = distribution.get_actions(deterministic=deterministic)
         log_prob = distribution.log_prob(actions)
-
         return actions, values, log_prob
 
     def evaluate_actions(
@@ -234,14 +230,14 @@ class DTODRLMaskablePolicy(MaskableActorCriticPolicy):
         values = self._get_values(obs)
 
         distribution = self.action_dist.proba_distribution(
-            node_scores_masked=node_scores_masked, loc_scores=loc_scores
+            node_scores_masked=node_scores_masked,
+            loc_scores=loc_scores,
         )
         if action_masks is not None:
             distribution.apply_masking(action_masks)
 
         log_prob = distribution.log_prob(actions)
         entropy = distribution.entropy()
-
         return values, log_prob, entropy
 
     def get_distribution(
@@ -251,7 +247,8 @@ class DTODRLMaskablePolicy(MaskableActorCriticPolicy):
     ):
         node_scores_masked, loc_scores = self._get_action_logits(obs, action_masks)
         distribution = self.action_dist.proba_distribution(
-            node_scores_masked=node_scores_masked, loc_scores=loc_scores
+            node_scores_masked=node_scores_masked,
+            loc_scores=loc_scores,
         )
         if action_masks is not None:
             distribution.apply_masking(action_masks)
@@ -259,59 +256,3 @@ class DTODRLMaskablePolicy(MaskableActorCriticPolicy):
 
     def predict_values(self, obs: PyTorchObs) -> torch.Tensor:
         return self._get_values(obs)
-
-    def _build_loc_K_embs_for_dtodrl(
-        self,
-        obs: Dict[str, torch.Tensor],
-        loc_embs: torch.Tensor,
-    ) -> torch.Tensor:
-        """论文 slocations: K 个候选位置的 embedding, [mean(UE_loc), ES1, ES2, ...]"""
-        ue_num = obs["ue_upload_EAT"].shape[-1] if obs["ue_upload_EAT"].dim() > 0 else obs["ue_upload_EAT"].shape[0]
-        if loc_embs.dim() == 2:
-            local_mean = loc_embs[:ue_num].mean(dim=0, keepdim=True)
-            es_embs = loc_embs[ue_num:]
-            loc_K = torch.cat([local_mean, es_embs], dim=0)  # (K, d)
-            return loc_K.unsqueeze(0)
-        else:
-            B, L, d = loc_embs.shape
-            local_mean = loc_embs[:, :ue_num].mean(dim=1, keepdim=True)  # (B, 1, d)
-            es_embs = loc_embs[:, ue_num:]  # (B, M, d)
-            loc_K = torch.cat([local_mean, es_embs], dim=1)  # (B, K, d)
-            return loc_K
-
-    def _build_candidate_loc_embs(
-        self,
-        obs: Dict[str, torch.Tensor],
-        loc_embs: torch.Tensor,
-    ) -> torch.Tensor:
-        nodes_ue_id = obs["nodes_ue_id"].long()
-        if loc_embs.dim() == 2:
-            N = nodes_ue_id.shape[0]
-            L, d = loc_embs.shape
-            ue_num = obs["ue_upload_EAT"].shape[0]
-            es_embs = loc_embs[ue_num:]
-            out = []
-            for i in range(N):
-                ue_id = int(nodes_ue_id[i].item())
-                local_emb = loc_embs[ue_id].unsqueeze(0)
-                cand_i = torch.cat([local_emb, es_embs], dim=0)
-                out.append(cand_i)
-            return torch.stack(out, dim=0)
-
-        elif loc_embs.dim() == 3:
-            B, L, d = loc_embs.shape
-            _, N = nodes_ue_id.shape
-            ue_num = obs["ue_upload_EAT"].shape[-1]
-            out = []
-            for b in range(B):
-                es_embs = loc_embs[b, ue_num:]
-                per_env = []
-                for i in range(N):
-                    ue_id = int(nodes_ue_id[b, i].item())
-                    local_emb = loc_embs[b, ue_id].unsqueeze(0)
-                    cand_i = torch.cat([local_emb, es_embs], dim=0)
-                    per_env.append(cand_i)
-                out.append(torch.stack(per_env, dim=0))
-            return torch.stack(out, dim=0)
-        else:
-            raise ValueError(f"Unexpected loc_embs shape: {tuple(loc_embs.shape)}")
