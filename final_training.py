@@ -94,8 +94,8 @@ class DAGConfig:
     tr_ue_es = 50e6 # ue_es传输速度
     tr_es_es = 200e6    # es_es传输速度
     # 奖励函数: baseline (local oracle, no scale) | improved (greedy oracle + scale)
-    reward_oracle: str = "local"   # "local" | "greedy"
-    reward_scale: bool = False
+    reward_oracle: str = "greedy"   # "local" | "greedy"
+    reward_scale: bool = True
 
 class DTODRLTrainer:
     def __init__(self,
@@ -356,8 +356,8 @@ def build_env_from_dag_case(
         tr_ue_es: float,
         tr_es_es: float,
         *,
-        reward_oracle: str = "local",
-        reward_scale: bool = False,
+        reward_oracle: str = "greedy",
+        reward_scale: bool = True,
 ):
     """
     独立建立env
@@ -426,8 +426,8 @@ def make_dto_env_controller(
         tr_es_es: float,
         seed0: int = 0,
         *,
-        reward_oracle: str = "local",
-        reward_scale: bool = False,
+        reward_oracle: str = "greedy",
+        reward_scale: bool = True,
 ):
     # 以seed0为基准 创建 (seed0+i) 的controller
     counter = {"i": 0}

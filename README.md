@@ -215,6 +215,8 @@ The default command-line entry in [`final_training.py`](./final_training.py) cur
 - `ue_numbers = 3`
 - `es_numbers = 2`
 - `n_compute_nodes_per_ue = 20`
+- `reward_oracle = "greedy"`
+- `reward_scale = True`
 
 If you want to change the training budget or DAG size, edit:
 

@@ -26,8 +26,8 @@ class DTOEnv(gym.Env):
         self,
         scheduler,
         *,
-        reward_oracle: str = "local",
-        reward_scale: bool = False,
+        reward_oracle: str = "greedy",
+        reward_scale: bool = True,
     ):
         """
         reward_oracle: "local" (baseline 全部本地) | "greedy" (每步选最优 loc)
@@ -271,9 +271,14 @@ class DTOEnv(gym.Env):
         scheduler.download_trace.clear()
 
         # 初始化eft 即全部本地部署的特殊情况
-        self.prev_mean_eft = self.scheduler.estimate_complete_mean_eft_by_copy(
-            unscheduled=self._unscheduled,
-        )
+        if self.reward_oracle == "greedy":
+            self.prev_mean_eft = self.scheduler.estimate_complete_mean_eft_by_copy_greedy(
+                unscheduled=self._unscheduled,
+            )
+        else:
+            self.prev_mean_eft = self.scheduler.estimate_complete_mean_eft_by_copy(
+                unscheduled=self._unscheduled,
+            )
 
         # ===== 每个 episode 换 DAG：重建 node_ids / adj =====
         self.end_nodes = set(getattr(scheduler, "end_nodes", []))
