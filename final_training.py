@@ -464,9 +464,14 @@ def run_rl_episode(env, model: MaskablePPO, deterministic: bool = True):
     obs, _ = env.reset()
     steps = 0
     step_infos = []
+    policy_step_stats = []
+    base_env = _get_base_env(env)
 
     while not env.done():
         masks = env.action_masks()
+        policy_stats = _collect_policy_step_stats(model, obs, masks, base_env)
+        if policy_stats:
+            policy_step_stats.append(policy_stats)
         action, _ = model.predict(obs, action_masks=masks, deterministic=deterministic)
 
         if isinstance(action, np.ndarray):
@@ -479,11 +484,12 @@ def run_rl_episode(env, model: MaskablePPO, deterministic: bool = True):
 
         steps += 1
 
-    ue_finish = list(env.scheduler.download_EAT.values())
+    ue_finish = list(base_env.scheduler.download_EAT.values())
     mean_aft = float(np.mean(ue_finish))
     makespan = float(np.max(ue_finish))
-    offload_stats = _summarize_offload(step_infos)
-    return mean_aft, makespan, steps, offload_stats
+    episode_stats = _summarize_offload(step_infos)
+    episode_stats.update(_summarize_policy_step_stats(policy_step_stats))
+    return mean_aft, makespan, steps, episode_stats
 
 
 def _get_base_env(env):
@@ -511,6 +517,103 @@ def _summarize_offload(step_infos) -> Dict[str, float]:
     }
 
 
+def _extract_distribution_probs(distribution) -> Optional[torch.Tensor]:
+    base_distribution = getattr(distribution, "distribution", None)
+    if base_distribution is not None and hasattr(base_distribution, "probs"):
+        return base_distribution.probs
+    if hasattr(distribution, "probs"):
+        return distribution.probs
+    return None
+
+
+def _collect_policy_step_stats(
+    model: MaskablePPO,
+    obs,
+    action_masks,
+    base_env,
+) -> Dict[str, float]:
+    try:
+        policy = model.policy
+        mask_tensor = torch.as_tensor(action_masks, dtype=torch.bool, device=policy.device)
+        distribution = policy.get_distribution(obs, action_masks=mask_tensor)
+    except Exception:
+        return {}
+
+    ready_count = len(base_env.ready_nodes())
+    if ready_count == 0:
+        return {}
+
+    if hasattr(distribution, "dist_loc"):
+        loc_probs = distribution.dist_loc.probs
+        if loc_probs.dim() > 1:
+            loc_probs = loc_probs[0]
+        local_mass = float(loc_probs[0].item())
+        es_mass = float(loc_probs[1:].sum().item())
+        local_argmax = float(torch.argmax(loc_probs).item() == 0)
+        return {
+            "policy_local_mass": local_mass,
+            "policy_es_mass": es_mass,
+            "policy_local_pref": local_mass,
+            "policy_es_pref": es_mass,
+            "policy_local_argmax_share": local_argmax,
+            "policy_es_argmax_share": 1.0 - local_argmax,
+        }
+
+    probs = _extract_distribution_probs(distribution)
+    if probs is None:
+        return {}
+    if probs.dim() > 1:
+        probs = probs[0]
+
+    num_locations = base_env.es_numbers + 1
+    pair_probs = probs.reshape(base_env.N, num_locations)
+    pair_mask = mask_tensor.reshape(base_env.N, num_locations)
+    ready_rows = pair_mask.any(dim=1)
+    if not ready_rows.any():
+        return {}
+
+    ready_pair_probs = pair_probs[ready_rows]
+    row_mass = ready_pair_probs.sum(dim=1).clamp_min(1e-9)
+    local_pref = ready_pair_probs[:, 0] / row_mass
+    local_argmax = (ready_pair_probs.argmax(dim=1) == 0).float()
+
+    local_mass = float(ready_pair_probs[:, 0].sum().item())
+    es_mass = float(ready_pair_probs[:, 1:].sum().item())
+    local_pref_avg = float(local_pref.mean().item())
+    local_argmax_share = float(local_argmax.mean().item())
+    return {
+        "policy_local_mass": local_mass,
+        "policy_es_mass": es_mass,
+        "policy_local_pref": local_pref_avg,
+        "policy_es_pref": 1.0 - local_pref_avg,
+        "policy_local_argmax_share": local_argmax_share,
+        "policy_es_argmax_share": 1.0 - local_argmax_share,
+    }
+
+
+def _append_metric_lists(metric_lists: Dict[str, List[float]], metrics: Dict[str, float]) -> None:
+    for key, value in metrics.items():
+        metric_lists.setdefault(key, []).append(float(value))
+
+
+def _summarize_metric_lists(metric_lists: Dict[str, List[float]]) -> Dict[str, float]:
+    summary = {}
+    for key, values in metric_lists.items():
+        summary[f"{key}_avg"] = float(np.mean(values))
+        summary[f"{key}_std"] = float(np.std(values))
+    return summary
+
+
+def _summarize_policy_step_stats(policy_step_stats: List[Dict[str, float]]) -> Dict[str, float]:
+    if not policy_step_stats:
+        return {}
+
+    metric_lists: Dict[str, List[float]] = {}
+    for metrics in policy_step_stats:
+        _append_metric_lists(metric_lists, metrics)
+    return _summarize_metric_lists(metric_lists)
+
+
 def run_rl_episode_vec(venv: VecEnv, model: MaskablePPO, deterministic: bool = True):
     """
     评估网络（VecEnv，支持 VecNormalize 归一化）
@@ -521,10 +624,15 @@ def run_rl_episode_vec(venv: VecEnv, model: MaskablePPO, deterministic: bool = T
     steps = 0
     dones = [False]
     step_infos = []
+    policy_step_stats = []
     last_info = None
+    base_env = _get_base_env(venv.envs[0])
 
     while not dones[0]:
         masks = venv.envs[0].action_masks()
+        policy_stats = _collect_policy_step_stats(model, obs, masks, base_env)
+        if policy_stats:
+            policy_step_stats.append(policy_stats)
         action, _ = model.predict(obs, action_masks=masks, deterministic=deterministic)
         if isinstance(action, np.ndarray):
             action = action.reshape(-1)
@@ -545,8 +653,9 @@ def run_rl_episode_vec(venv: VecEnv, model: MaskablePPO, deterministic: bool = T
         ue_finish = list(base_env.scheduler.download_EAT.values())  # DTOEnv.scheduler
     mean_aft = float(np.mean(ue_finish))
     makespan = float(np.max(ue_finish))
-    offload_stats = _summarize_offload(step_infos)
-    return mean_aft, makespan, steps, offload_stats
+    episode_stats = _summarize_offload(step_infos)
+    episode_stats.update(_summarize_policy_step_stats(policy_step_stats))
+    return mean_aft, makespan, steps, episode_stats
 
 def run_baseline_episode(env, node_rule: "str"):
     """
@@ -579,6 +688,70 @@ def run_baseline_episode(env, node_rule: "str"):
     makespan = float(np.max(ue_finish))
     return mean_aft, makespan, steps
 
+
+def _build_eval_vec_env(case: DAGCase, dag_cfg: DAGConfig, norm_path: str):
+    env = build_env_from_dag_case(
+        case=case,
+        ue_number=dag_cfg.ue_numbers,
+        es_number=dag_cfg.es_numbers,
+        f_ue=dag_cfg.f_ue,
+        f_es=dag_cfg.f_es,
+        es_processors=4,
+        tr_ue_es=dag_cfg.tr_ue_es,
+        tr_es_es=dag_cfg.tr_es_es,
+        reward_oracle=getattr(dag_cfg, "reward_oracle", "greedy"),
+        reward_scale=getattr(dag_cfg, "reward_scale", True),
+    )
+    env = ActionMasker(env, lambda e: e.action_masks())
+    venv = DummyVecEnv([lambda e=env: e])
+    if os.path.exists(norm_path):
+        venv = VecNormalize.load(norm_path, venv)
+        venv.training = False
+    return venv
+
+
+def evaluate_trained_model(
+    model: MaskablePPO,
+    dag_cfg: DAGConfig,
+    norm_path: str,
+    *,
+    n_eval_seeds: int = 30,
+    deterministic: bool = True,
+    seed_base: int = 1000,
+) -> Dict[str, float]:
+    mean_aft_list: List[float] = []
+    makespan_list: List[float] = []
+    metric_lists: Dict[str, List[float]] = {}
+
+    for s in range(n_eval_seeds):
+        case = make_dag_case(
+            ue_number=dag_cfg.ue_numbers,
+            n_compute_nodes_per_ue=20,
+            start_count_max=3,
+            seed=seed_base + s,
+        )
+        venv = _build_eval_vec_env(case, dag_cfg, norm_path)
+        mean_aft, makespan, _, episode_stats = run_rl_episode_vec(
+            venv,
+            model,
+            deterministic=deterministic,
+        )
+        mean_aft_list.append(mean_aft)
+        makespan_list.append(makespan)
+        _append_metric_lists(metric_lists, episode_stats)
+        if hasattr(venv, "close"):
+            venv.close()
+
+    summary = {
+        "mean_AFT_avg": float(np.mean(mean_aft_list)),
+        "makespan_avg": float(np.mean(makespan_list)),
+        "mean_AFT_std": float(np.std(mean_aft_list)),
+        "makespan_std": float(np.std(makespan_list)),
+    }
+    summary.update(_summarize_metric_lists(metric_lists))
+    return summary
+
+
 def run_comparison_experiment(
     train_cfg: TrainConfig,
     dag_cfg: DAGConfig,
@@ -605,8 +778,8 @@ def run_comparison_experiment(
         es_processors=4,
         tr_ue_es=dag_cfg.tr_ue_es,
         tr_es_es=dag_cfg.tr_es_es,
-        reward_oracle=getattr(dag_cfg, "reward_oracle", "local"),
-        reward_scale=getattr(dag_cfg, "reward_scale", False),
+        reward_oracle=getattr(dag_cfg, "reward_oracle", "greedy"),
+        reward_scale=getattr(dag_cfg, "reward_scale", True),
     )
 
     results = {}
@@ -632,52 +805,38 @@ def run_comparison_experiment(
         print(f"  -> 模型已保存: {save_path}")
 
         # 评估（使用 VecNormalize 保持 obs 归一化与训练一致）
-        mean_aft_list, makespan_list = [], []
-        es_ratio_list, local_ratio_list = [], []
-        for s in range(n_eval_seeds):
-            case = make_dag_case(
-                ue_number=dag_cfg.ue_numbers,
-                n_compute_nodes_per_ue=20,
-                start_count_max=3,
-                seed=1000 + s,
-            )
-            env = build_env_from_dag_case(
-                case=case,
-                ue_number=dag_cfg.ue_numbers,
-                es_number=dag_cfg.es_numbers,
-                f_ue=dag_cfg.f_ue,
-                f_es=dag_cfg.f_es,
-                es_processors=4,
-                tr_ue_es=dag_cfg.tr_ue_es,
-                tr_es_es=dag_cfg.tr_es_es,
-                reward_oracle=getattr(dag_cfg, "reward_oracle", "local"),
-                reward_scale=getattr(dag_cfg, "reward_scale", False),
-            )
-            env = ActionMasker(env, lambda e: e.action_masks())
-            venv = DummyVecEnv([lambda e=env: e])
-            if os.path.exists(norm_path):
-                venv = VecNormalize.load(norm_path, venv)
-                venv.training = False
-            mean_aft, makespan, steps, offload_stats = run_rl_episode_vec(venv, model, deterministic=True)
-            mean_aft_list.append(mean_aft)
-            makespan_list.append(makespan)
-            es_ratio_list.append(offload_stats["es_ratio"])
-            local_ratio_list.append(offload_stats["local_ratio"])
+        det_summary = evaluate_trained_model(
+            model,
+            dag_cfg,
+            norm_path,
+            n_eval_seeds=n_eval_seeds,
+            deterministic=True,
+        )
+        stochastic_summary = evaluate_trained_model(
+            model,
+            dag_cfg,
+            norm_path,
+            n_eval_seeds=n_eval_seeds,
+            deterministic=False,
+        )
 
-        results[model_type] = {
-            "mean_AFT_avg": float(np.mean(mean_aft_list)),
-            "makespan_avg": float(np.mean(makespan_list)),
-            "mean_AFT_std": float(np.std(mean_aft_list)),
-            "makespan_std": float(np.std(makespan_list)),
-            "es_ratio_avg": float(np.mean(es_ratio_list)),
-            "local_ratio_avg": float(np.mean(local_ratio_list)),
-            "es_ratio_std": float(np.std(es_ratio_list)),
-            "local_ratio_std": float(np.std(local_ratio_list)),
-        }
+        results[model_type] = dict(det_summary)
+        results[model_type].update(
+            {f"stochastic_{key}": value for key, value in stochastic_summary.items()}
+        )
         print(f"  -> meanAFT(avg)={results[model_type]['mean_AFT_avg']:.6f}, "
               f"makespan(avg)={results[model_type]['makespan_avg']:.6f}, "
               f"es_ratio(avg)={results[model_type]['es_ratio_avg']:.3f}, "
               f"local_ratio(avg)={results[model_type]['local_ratio_avg']:.3f}")
+        print(f"     stochastic es/local = "
+              f"{results[model_type]['stochastic_es_ratio_avg']:.3f}/"
+              f"{results[model_type]['stochastic_local_ratio_avg']:.3f}")
+        print(f"     policy mass(es/local) = "
+              f"{results[model_type].get('policy_es_mass_avg', 0.0):.3f}/"
+              f"{results[model_type].get('policy_local_mass_avg', 0.0):.3f}")
+        print(f"     per-ready pref(es/local) = "
+              f"{results[model_type].get('policy_es_pref_avg', 0.0):.3f}/"
+              f"{results[model_type].get('policy_local_pref_avg', 0.0):.3f}")
 
     # 打印对比表
     title = "横向对比 (TransformerConv)" if "dtodrl_tf" in methods else "DTODRL vs Joint vs Two-Stage 对比结果"
@@ -690,7 +849,12 @@ def run_comparison_experiment(
         r = results[name]
         print(f"{name:<12} | {r['mean_AFT_avg']:>12.4f} ± {r['mean_AFT_std']:>8.4f} | "
               f"{r['makespan_avg']:>12.4f} ± {r['makespan_std']:>8.4f}")
-        print(f"{'':12} | es/local ratio = {r['es_ratio_avg']:.3f}/{r['local_ratio_avg']:.3f}")
+        print(f"{'':12} | det es/local = {r['es_ratio_avg']:.3f}/{r['local_ratio_avg']:.3f}")
+        print(f"{'':12} | stoch es/local = {r['stochastic_es_ratio_avg']:.3f}/{r['stochastic_local_ratio_avg']:.3f}")
+        print(f"{'':12} | policy mass(es/local) = "
+              f"{r.get('policy_es_mass_avg', 0.0):.3f}/{r.get('policy_local_mass_avg', 0.0):.3f}")
+        print(f"{'':12} | per-ready pref(es/local) = "
+              f"{r.get('policy_es_pref_avg', 0.0):.3f}/{r.get('policy_local_pref_avg', 0.0):.3f}")
     print(f"{'='*70}\n")
 
     # 保存结果到 JSON
@@ -778,52 +942,35 @@ def run_reward_comparison_experiment(
         norm_path = os.path.join(trainer.run_dic, "vecnormalize.pkl")
         print(f"  -> 模型已保存: {save_path}")
 
-        mean_aft_list, makespan_list = [], []
-        es_ratio_list, local_ratio_list = [], []
-        for s in range(n_eval_seeds):
-            case = make_dag_case(
-                ue_number=cfg.ue_numbers,
-                n_compute_nodes_per_ue=20,
-                start_count_max=3,
-                seed=1000 + s,
-            )
-            env = build_env_from_dag_case(
-                case=case,
-                ue_number=cfg.ue_numbers,
-                es_number=cfg.es_numbers,
-                f_ue=cfg.f_ue,
-                f_es=cfg.f_es,
-                es_processors=4,
-                tr_ue_es=cfg.tr_ue_es,
-                tr_es_es=cfg.tr_es_es,
-                reward_oracle=oracle,
-                reward_scale=scale,
-            )
-            env = ActionMasker(env, lambda e: e.action_masks())
-            venv = DummyVecEnv([lambda e=env: e])
-            if os.path.exists(norm_path):
-                venv = VecNormalize.load(norm_path, venv)
-                venv.training = False
-            mean_aft, makespan, _, offload_stats = run_rl_episode_vec(venv, model, deterministic=True)
-            mean_aft_list.append(mean_aft)
-            makespan_list.append(makespan)
-            es_ratio_list.append(offload_stats["es_ratio"])
-            local_ratio_list.append(offload_stats["local_ratio"])
+        det_summary = evaluate_trained_model(
+            model,
+            cfg,
+            norm_path,
+            n_eval_seeds=n_eval_seeds,
+            deterministic=True,
+        )
+        stochastic_summary = evaluate_trained_model(
+            model,
+            cfg,
+            norm_path,
+            n_eval_seeds=n_eval_seeds,
+            deterministic=False,
+        )
 
-        results[name] = {
-            "mean_AFT_avg": float(np.mean(mean_aft_list)),
-            "makespan_avg": float(np.mean(makespan_list)),
-            "mean_AFT_std": float(np.std(mean_aft_list)),
-            "makespan_std": float(np.std(makespan_list)),
-            "es_ratio_avg": float(np.mean(es_ratio_list)),
-            "local_ratio_avg": float(np.mean(local_ratio_list)),
-            "es_ratio_std": float(np.std(es_ratio_list)),
-            "local_ratio_std": float(np.std(local_ratio_list)),
-        }
+        results[name] = dict(det_summary)
+        results[name].update(
+            {f"stochastic_{key}": value for key, value in stochastic_summary.items()}
+        )
         print(f"  -> meanAFT(avg)={results[name]['mean_AFT_avg']:.6f}, "
               f"makespan(avg)={results[name]['makespan_avg']:.6f}, "
               f"es_ratio(avg)={results[name]['es_ratio_avg']:.3f}, "
               f"local_ratio(avg)={results[name]['local_ratio_avg']:.3f}")
+        print(f"     stochastic es/local = "
+              f"{results[name]['stochastic_es_ratio_avg']:.3f}/"
+              f"{results[name]['stochastic_local_ratio_avg']:.3f}")
+        print(f"     policy mass(es/local) = "
+              f"{results[name].get('policy_es_mass_avg', 0.0):.3f}/"
+              f"{results[name].get('policy_local_mass_avg', 0.0):.3f}")
 
     print(f"\n{'='*70}")
     print("奖励函数对比结果 (baseline vs improved)")
@@ -832,7 +979,10 @@ def run_reward_comparison_experiment(
     print("-" * 70)
     for name in ["baseline", "improved"]:
         r = results[name]
-        print(f"{'':12} | es/local ratio = {r['es_ratio_avg']:.3f}/{r['local_ratio_avg']:.3f}")
+        print(f"{'':12} | det es/local = {r['es_ratio_avg']:.3f}/{r['local_ratio_avg']:.3f}")
+        print(f"{'':12} | stoch es/local = {r['stochastic_es_ratio_avg']:.3f}/{r['stochastic_local_ratio_avg']:.3f}")
+        print(f"{'':12} | policy mass(es/local) = "
+              f"{r.get('policy_es_mass_avg', 0.0):.3f}/{r.get('policy_local_mass_avg', 0.0):.3f}")
         print(f"{name:<12} | {r['mean_AFT_avg']:>12.4f} ± {r['mean_AFT_std']:>8.4f} | "
               f"{r['makespan_avg']:>12.4f} ± {r['makespan_std']:>8.4f}")
     print(f"{'='*70}\n")
@@ -925,8 +1075,8 @@ if __name__ == "__main__":
             es_processors=4,
             tr_ue_es=dag_cfg.tr_ue_es,
             tr_es_es=dag_cfg.tr_es_es,
-            reward_oracle=getattr(dag_cfg, "reward_oracle", "local"),
-            reward_scale=getattr(dag_cfg, "reward_scale", False),
+            reward_oracle=getattr(dag_cfg, "reward_oracle", "greedy"),
+            reward_scale=getattr(dag_cfg, "reward_scale", True),
         )
 
         trainer = DTODRLTrainer(config=train_cfg, env_controller=rl_train_controller)
@@ -935,6 +1085,44 @@ if __name__ == "__main__":
 
         # 拿到训练完的模型 (可用于后续评估)
         model = trainer.model
+        norm_path = os.path.join(trainer.run_dic, "vecnormalize.pkl")
+        det_summary = evaluate_trained_model(
+            model,
+            dag_cfg,
+            norm_path,
+            n_eval_seeds=10,
+            deterministic=True,
+        )
+        stochastic_summary = evaluate_trained_model(
+            model,
+            dag_cfg,
+            norm_path,
+            n_eval_seeds=10,
+            deterministic=False,
+        )
+        print(f"[DIAG] det es/local = {det_summary.get('es_ratio_avg', 0.0):.3f}/"
+              f"{det_summary.get('local_ratio_avg', 0.0):.3f}")
+        print(f"[DIAG] stoch es/local = {stochastic_summary.get('es_ratio_avg', 0.0):.3f}/"
+              f"{stochastic_summary.get('local_ratio_avg', 0.0):.3f}")
+        print(f"[DIAG] policy mass(es/local) = {det_summary.get('policy_es_mass_avg', 0.0):.3f}/"
+              f"{det_summary.get('policy_local_mass_avg', 0.0):.3f}")
+        print(f"[DIAG] per-ready pref(es/local) = {det_summary.get('policy_es_pref_avg', 0.0):.3f}/"
+              f"{det_summary.get('policy_local_pref_avg', 0.0):.3f}")
+
+        import json
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        diag_path = os.path.join(trainer.run_dic, f"policy_diagnosis_{ts}.json")
+        with open(diag_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "deterministic": det_summary,
+                    "stochastic": stochastic_summary,
+                },
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
+        print(f"[DIAG] saved to {diag_path}")
 
     # ========== baseline vs. PPO+GAT 评估模块 (取消注释后启用) ==========
 

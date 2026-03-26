@@ -179,6 +179,7 @@ Important files inside a run directory:
 - `final_model.zip`
 - `vecnormalize.pkl` when `use_vecnormalize=True`
 - TensorBoard event files
+- `policy_diagnosis_*.json` after single-method training runs
 
 Comparison scripts additionally save JSON summaries directly under `runs/`, for example:
 
@@ -194,6 +195,8 @@ Current comparison outputs also record:
 - `local_ratio_std`
 
 These metrics help detect whether a policy collapses to all-local or all-ES assignment.
+
+Recent diagnostics also include deterministic vs stochastic ratios and policy-side local/ES probability mass, which are useful for checking whether collapse comes from the learned distribution itself or only from greedy action selection.
 
 ## 7. TensorBoard
 
