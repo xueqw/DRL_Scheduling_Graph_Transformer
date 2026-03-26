@@ -463,6 +463,7 @@ def run_rl_episode(env, model: MaskablePPO, deterministic: bool = True):
     """
     obs, _ = env.reset()
     steps = 0
+    step_infos = []
 
     while not env.done():
         masks = env.action_masks()
@@ -472,13 +473,17 @@ def run_rl_episode(env, model: MaskablePPO, deterministic: bool = True):
             action = int(action.item())  # 或 action[0]
 
         obs, reward, terminated, truncated, info = env.step(action)
+        step_info = info.get("step_info")
+        if step_info is not None:
+            step_infos.append(step_info)
 
         steps += 1
 
     ue_finish = list(env.scheduler.download_EAT.values())
     mean_aft = float(np.mean(ue_finish))
     makespan = float(np.max(ue_finish))
-    return mean_aft, makespan, steps
+    offload_stats = _summarize_offload(step_infos)
+    return mean_aft, makespan, steps, offload_stats
 
 
 def _get_base_env(env):
@@ -486,6 +491,24 @@ def _get_base_env(env):
     while hasattr(env, "env"):
         env = env.env
     return env
+
+
+def _summarize_offload(step_infos) -> Dict[str, float]:
+    if not step_infos:
+        return {"es_ratio": 0.0, "local_ratio": 0.0}
+
+    total = len(step_infos)
+    local_count = sum(
+        1
+        for step_info in step_infos
+        if getattr(step_info, "chosen_loc_ue_id", None) is not None
+        or getattr(step_info, "chosen_loc_id", None) == 0
+    )
+    es_count = total - local_count
+    return {
+        "es_ratio": float(es_count) / float(total),
+        "local_ratio": float(local_count) / float(total),
+    }
 
 
 def run_rl_episode_vec(venv: VecEnv, model: MaskablePPO, deterministic: bool = True):
@@ -497,6 +520,8 @@ def run_rl_episode_vec(venv: VecEnv, model: MaskablePPO, deterministic: bool = T
         obs = obs[0]
     steps = 0
     dones = [False]
+    step_infos = []
+    last_info = None
 
     while not dones[0]:
         masks = venv.envs[0].action_masks()
@@ -504,15 +529,24 @@ def run_rl_episode_vec(venv: VecEnv, model: MaskablePPO, deterministic: bool = T
         if isinstance(action, np.ndarray):
             action = action.reshape(-1)
         obs, rewards, dones, infos = venv.step(action)
+        if infos:
+            last_info = infos[0]
+            step_info = last_info.get("step_info")
+            if step_info is not None:
+                step_infos.append(step_info)
         if isinstance(obs, tuple):
             obs = obs[0]
         steps += 1
 
-    base_env = _get_base_env(venv.envs[0])
-    ue_finish = list(base_env.scheduler.download_EAT.values())  # DTOEnv.scheduler
+    if last_info and "step_info" in last_info:
+        ue_finish = list(last_info["step_info"].makespan_by_ue.values())
+    else:
+        base_env = _get_base_env(venv.envs[0])
+        ue_finish = list(base_env.scheduler.download_EAT.values())  # DTOEnv.scheduler
     mean_aft = float(np.mean(ue_finish))
     makespan = float(np.max(ue_finish))
-    return mean_aft, makespan, steps
+    offload_stats = _summarize_offload(step_infos)
+    return mean_aft, makespan, steps, offload_stats
 
 def run_baseline_episode(env, node_rule: "str"):
     """
@@ -599,10 +633,11 @@ def run_comparison_experiment(
 
         # 评估（使用 VecNormalize 保持 obs 归一化与训练一致）
         mean_aft_list, makespan_list = [], []
+        es_ratio_list, local_ratio_list = [], []
         for s in range(n_eval_seeds):
             case = make_dag_case(
                 ue_number=dag_cfg.ue_numbers,
-                n_compute_nodes_per_ue=50,
+                n_compute_nodes_per_ue=20,
                 start_count_max=3,
                 seed=1000 + s,
             )
@@ -623,18 +658,26 @@ def run_comparison_experiment(
             if os.path.exists(norm_path):
                 venv = VecNormalize.load(norm_path, venv)
                 venv.training = False
-            mean_aft, makespan, steps = run_rl_episode_vec(venv, model, deterministic=True)
+            mean_aft, makespan, steps, offload_stats = run_rl_episode_vec(venv, model, deterministic=True)
             mean_aft_list.append(mean_aft)
             makespan_list.append(makespan)
+            es_ratio_list.append(offload_stats["es_ratio"])
+            local_ratio_list.append(offload_stats["local_ratio"])
 
         results[model_type] = {
             "mean_AFT_avg": float(np.mean(mean_aft_list)),
             "makespan_avg": float(np.mean(makespan_list)),
             "mean_AFT_std": float(np.std(mean_aft_list)),
             "makespan_std": float(np.std(makespan_list)),
+            "es_ratio_avg": float(np.mean(es_ratio_list)),
+            "local_ratio_avg": float(np.mean(local_ratio_list)),
+            "es_ratio_std": float(np.std(es_ratio_list)),
+            "local_ratio_std": float(np.std(local_ratio_list)),
         }
         print(f"  -> meanAFT(avg)={results[model_type]['mean_AFT_avg']:.6f}, "
-              f"makespan(avg)={results[model_type]['makespan_avg']:.6f}")
+              f"makespan(avg)={results[model_type]['makespan_avg']:.6f}, "
+              f"es_ratio(avg)={results[model_type]['es_ratio_avg']:.3f}, "
+              f"local_ratio(avg)={results[model_type]['local_ratio_avg']:.3f}")
 
     # 打印对比表
     title = "横向对比 (TransformerConv)" if "dtodrl_tf" in methods else "DTODRL vs Joint vs Two-Stage 对比结果"
@@ -647,6 +690,7 @@ def run_comparison_experiment(
         r = results[name]
         print(f"{name:<12} | {r['mean_AFT_avg']:>12.4f} ± {r['mean_AFT_std']:>8.4f} | "
               f"{r['makespan_avg']:>12.4f} ± {r['makespan_std']:>8.4f}")
+        print(f"{'':12} | es/local ratio = {r['es_ratio_avg']:.3f}/{r['local_ratio_avg']:.3f}")
     print(f"{'='*70}\n")
 
     # 保存结果到 JSON
@@ -735,10 +779,11 @@ def run_reward_comparison_experiment(
         print(f"  -> 模型已保存: {save_path}")
 
         mean_aft_list, makespan_list = [], []
+        es_ratio_list, local_ratio_list = [], []
         for s in range(n_eval_seeds):
             case = make_dag_case(
                 ue_number=cfg.ue_numbers,
-                n_compute_nodes_per_ue=50,
+                n_compute_nodes_per_ue=20,
                 start_count_max=3,
                 seed=1000 + s,
             )
@@ -759,18 +804,26 @@ def run_reward_comparison_experiment(
             if os.path.exists(norm_path):
                 venv = VecNormalize.load(norm_path, venv)
                 venv.training = False
-            mean_aft, makespan, _ = run_rl_episode_vec(venv, model, deterministic=True)
+            mean_aft, makespan, _, offload_stats = run_rl_episode_vec(venv, model, deterministic=True)
             mean_aft_list.append(mean_aft)
             makespan_list.append(makespan)
+            es_ratio_list.append(offload_stats["es_ratio"])
+            local_ratio_list.append(offload_stats["local_ratio"])
 
         results[name] = {
             "mean_AFT_avg": float(np.mean(mean_aft_list)),
             "makespan_avg": float(np.mean(makespan_list)),
             "mean_AFT_std": float(np.std(mean_aft_list)),
             "makespan_std": float(np.std(makespan_list)),
+            "es_ratio_avg": float(np.mean(es_ratio_list)),
+            "local_ratio_avg": float(np.mean(local_ratio_list)),
+            "es_ratio_std": float(np.std(es_ratio_list)),
+            "local_ratio_std": float(np.std(local_ratio_list)),
         }
         print(f"  -> meanAFT(avg)={results[name]['mean_AFT_avg']:.6f}, "
-              f"makespan(avg)={results[name]['makespan_avg']:.6f}")
+              f"makespan(avg)={results[name]['makespan_avg']:.6f}, "
+              f"es_ratio(avg)={results[name]['es_ratio_avg']:.3f}, "
+              f"local_ratio(avg)={results[name]['local_ratio_avg']:.3f}")
 
     print(f"\n{'='*70}")
     print("奖励函数对比结果 (baseline vs improved)")
@@ -779,6 +832,7 @@ def run_reward_comparison_experiment(
     print("-" * 70)
     for name in ["baseline", "improved"]:
         r = results[name]
+        print(f"{'':12} | es/local ratio = {r['es_ratio_avg']:.3f}/{r['local_ratio_avg']:.3f}")
         print(f"{name:<12} | {r['mean_AFT_avg']:>12.4f} ± {r['mean_AFT_std']:>8.4f} | "
               f"{r['makespan_avg']:>12.4f} ± {r['makespan_std']:>8.4f}")
     print(f"{'='*70}\n")

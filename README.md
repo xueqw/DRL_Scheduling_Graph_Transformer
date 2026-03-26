@@ -1,41 +1,249 @@
-# DRL_Scheduling
+# DRL Scheduling Graph Transformer
 
-Dependent Task Offloading (DTO) with Deep Reinforcement Learning. 实现 DTODRL（论文基线）、Joint、Two-Stage 三种方法对比。
+This repository implements dependent task offloading (DTO) in edge computing with several reinforcement-learning policies:
 
-## 方法
+- `joint`: single-stage joint scoring over `(node, location)`
+- `two_stage`: select node first, then select location
+- `dtodrl`: paper-style DTODRL baseline with separate node/location heads
+- `dtodrl_tf`: DTODRL heads on the shared Transformer-based backbone
 
-- **DTODRL**: 论文 *Dependent Task Offloading in Edge Computing Using GNN and Deep Reinforcement Learning* 原方法，Node Head + Location Head 独立双头
-- **Joint**: 单阶段 (node, loc) 联合打分
-- **Two-Stage**: 两阶段，先选 Node 再选 Location
+The main training and evaluation entry point is [`final_training.py`](./final_training.py).
 
-## 运行
+## 1. Environment
+
+Recommended:
+
+- Python 3.10 or 3.11
+- PyTorch with CUDA if you want GPU training
+- Linux or Windows
+
+Core Python dependencies used by this repo:
+
+- `torch`
+- `torch-geometric`
+- `stable-baselines3`
+- `sb3-contrib`
+- `gymnasium`
+- `tensorboard`
+- `numpy`
+- `gensim`
+
+Optional utilities:
+
+- `matplotlib`
+- `networkx`
+
+## 2. Installation
+
+Create and activate a clean environment first.
+
+### Conda example
 
 ```bash
-# 单方法训练
-python final_training.py joint      # 或 two_stage / dtodrl
-
-# 方法对比实验 (DTODRL vs Joint vs Two-Stage，各自原图编码)
-python final_training.py comparison
-# 或 python run_comparison.py
-
-# 横向对比 (统一 TransformerConv 图编码)
-python final_training.py comparison_transformer
-# 或 python run_comparison_transformer.py
-
-# 奖励函数对比实验 (baseline vs improved)
-python final_training.py reward_comparison [joint]
-# 或 python run_reward_comparison.py [joint]
+conda create -n drl_sched python=3.10 -y
+conda activate drl_sched
 ```
 
-## 奖励函数
+### Install PyTorch
 
-- **baseline** (默认): 论文 oracle，剩余节点全部本地执行预估 mean_eft，无缩放
-- **improved**: greedy oracle（每步选 EFT 最小 loc）+ 相对奖励缩放
-- 可通过 `DAGConfig(reward_oracle="greedy", reward_scale=True)` 使用改进版
+Install a PyTorch build that matches your machine first.
 
-## 依赖
+Examples:
 
-- Python 3.8+
-- PyTorch, torch-geometric
-- stable-baselines3, sb3-contrib
-- gymnasium
+```bash
+# CUDA example
+pip install torch torchvision torchaudio
+
+# CPU-only example
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+```
+
+### Install PyTorch Geometric
+
+Install `torch-geometric` with wheels that match your installed PyTorch version and CUDA/CPU setup.
+
+Typical command:
+
+```bash
+pip install torch-geometric
+```
+
+If your machine needs the version-matched wheels from PyG, install them according to the official PyTorch Geometric instructions for your Torch version.
+
+### Install the remaining packages
+
+```bash
+pip install stable-baselines3 sb3-contrib gymnasium tensorboard numpy gensim matplotlib networkx
+```
+
+## 3. Quick Start
+
+Clone the repository and enter the project directory:
+
+```bash
+git clone https://github.com/xueqw/DRL_Scheduling_Graph_Transformer.git
+cd DRL_Scheduling_Graph_Transformer
+```
+
+Run a quick local smoke test first:
+
+```bash
+python smoke_test.py
+```
+
+Then train one policy:
+
+```bash
+python final_training.py joint
+```
+
+Other supported single-method modes:
+
+```bash
+python final_training.py two_stage
+python final_training.py dtodrl
+python final_training.py dtodrl_tf
+```
+
+## 4. Comparison Experiments
+
+Run the three-method comparison:
+
+```bash
+python final_training.py comparison
+```
+
+Equivalent wrapper:
+
+```bash
+python run_comparison.py
+```
+
+Run the shared-transformer comparison:
+
+```bash
+python final_training.py comparison_transformer
+```
+
+Equivalent wrapper:
+
+```bash
+python run_comparison_transformer.py
+```
+
+Run the reward comparison:
+
+```bash
+python final_training.py reward_comparison
+```
+
+Or specify the policy explicitly:
+
+```bash
+python final_training.py reward_comparison joint
+python final_training.py reward_comparison two_stage
+python final_training.py reward_comparison dtodrl
+```
+
+Equivalent wrapper:
+
+```bash
+python run_reward_comparison.py joint
+```
+
+## 5. Optional GAT Pretraining
+
+If you want to pretrain the DTODRL GAT encoder first:
+
+```bash
+python gat_pretrain.py
+```
+
+This saves a pretrained encoder state dict. To actually use that checkpoint in `dtodrl`, set the following fields in [`final_training.py`](./final_training.py):
+
+- `TrainConfig.dtodrl_pretrained_gat`
+- `TrainConfig.dtodrl_freeze_pretrained_gat`
+
+## 6. Outputs
+
+By default, outputs are written under `./runs`.
+
+Single-policy training creates a timestamped run directory such as:
+
+```text
+runs/DTO_DRL_20260326-123456/
+```
+
+Important files inside a run directory:
+
+- `final_model.zip`
+- `vecnormalize.pkl` when `use_vecnormalize=True`
+- TensorBoard event files
+
+Comparison scripts additionally save JSON summaries directly under `runs/`, for example:
+
+- `comparison_results_*.json`
+- `comparison_transformer_results_*.json`
+- `reward_comparison_*.json`
+
+Current comparison outputs also record:
+
+- `es_ratio_avg`
+- `local_ratio_avg`
+- `es_ratio_std`
+- `local_ratio_std`
+
+These metrics help detect whether a policy collapses to all-local or all-ES assignment.
+
+## 7. TensorBoard
+
+Launch TensorBoard from the repo root:
+
+```bash
+tensorboard --logdir runs
+```
+
+Then open the local TensorBoard URL shown in the terminal.
+
+## 8. Default Training Settings
+
+The default command-line entry in [`final_training.py`](./final_training.py) currently uses:
+
+- `n_envs = 8`
+- `total_timesteps = 50000`
+- `seed = 0`
+- `ue_numbers = 3`
+- `es_numbers = 2`
+- `n_compute_nodes_per_ue = 20`
+
+If you want to change the training budget or DAG size, edit:
+
+- `TrainConfig`
+- `DAGConfig`
+- the `if __name__ == "__main__":` block in [`final_training.py`](./final_training.py)
+
+The wrapper scripts use the same defaults.
+
+## 9. Notes
+
+- Device selection is automatic: the code uses CUDA when available, otherwise CPU.
+- The environment import in [`DTO_env.py`](./DTO_env.py) is expected to resolve `Node` from the local [`DTO_scheduler.py`](./DTO_scheduler.py).
+- Some auxiliary visualization scripts require `matplotlib` and `networkx`.
+- This repo does not currently ship a pinned `requirements.txt`, so if you are reproducing results on a new machine, install the packages above in a clean virtual environment.
+
+## 10. Minimal Run Checklist
+
+If you just want the shortest path to a training run:
+
+```bash
+conda create -n drl_sched python=3.10 -y
+conda activate drl_sched
+pip install torch torchvision torchaudio
+pip install torch-geometric
+pip install stable-baselines3 sb3-contrib gymnasium tensorboard numpy gensim matplotlib networkx
+git clone https://github.com/xueqw/DRL_Scheduling_Graph_Transformer.git
+cd DRL_Scheduling_Graph_Transformer
+python smoke_test.py
+python final_training.py joint
+tensorboard --logdir runs
+```

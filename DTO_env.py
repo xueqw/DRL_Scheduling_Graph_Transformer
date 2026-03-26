@@ -4,7 +4,7 @@ from typing import Set, Dict, List, Tuple, Optional
 import numpy as np
 from gensim.models import FastText
 
-from GNNDAG.DTO_scheduler import Node
+from DTO_scheduler import Node
 import gymnasium as gym
 from gymnasium import spaces
 

@@ -84,6 +84,12 @@ class TwoStageMaskablePolicy(MaskableActorCriticPolicy):
             gat_layers=gat_layers,
             use_cp=kwargs.get("use_cp", False),
         )
+        # Let local/ES scoring see the current UE-side queue pressure.
+        self.loc_context_encoder = nn.Sequential(
+            nn.Linear(3, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
 
         self.actor = TwoStageActor(hidden_dim=hidden_dim)
         self.critic = JointCritic(hidden_dim=hidden_dim)
@@ -220,6 +226,19 @@ class TwoStageMaskablePolicy(MaskableActorCriticPolicy):
     def predict_values(self, obs: PyTorchObs) -> torch.Tensor:
         return self._get_values(obs)
 
+    def _augment_candidate_loc_embs(
+        self,
+        candidate_loc_embs: torch.Tensor,
+        ue_upload_eat: torch.Tensor,
+        ue_download_eat: torch.Tensor,
+    ) -> torch.Tensor:
+        context = candidate_loc_embs.new_zeros((candidate_loc_embs.shape[0], 3))
+        context[0, 0] = 1.0
+        if candidate_loc_embs.shape[0] > 1:
+            context[1:, 1] = torch.log1p(ue_upload_eat.float())
+            context[1:, 2] = torch.log1p(ue_download_eat.float())
+        return candidate_loc_embs + self.loc_context_encoder(context)
+
     def _build_candidate_loc_embs(
         self,
         obs: Dict[str, torch.Tensor],
@@ -237,6 +256,11 @@ class TwoStageMaskablePolicy(MaskableActorCriticPolicy):
                 ue_id = int(nodes_ue_id[i].item())
                 local_emb = loc_embs[ue_id].unsqueeze(0)
                 cand_i = torch.cat([local_emb, es_embs], dim=0)
+                cand_i = self._augment_candidate_loc_embs(
+                    cand_i,
+                    obs["ue_upload_EAT"][ue_id],
+                    obs["ue_download_EAT"][ue_id],
+                )
                 out.append(cand_i)
             return torch.stack(out, dim=0)
 
@@ -253,6 +277,11 @@ class TwoStageMaskablePolicy(MaskableActorCriticPolicy):
                     ue_id = int(nodes_ue_id[b, i].item())
                     local_emb = loc_embs[b, ue_id].unsqueeze(0)
                     cand_i = torch.cat([local_emb, es_embs], dim=0)
+                    cand_i = self._augment_candidate_loc_embs(
+                        cand_i,
+                        obs["ue_upload_EAT"][b, ue_id],
+                        obs["ue_download_EAT"][b, ue_id],
+                    )
                     per_env.append(cand_i)
                 out.append(torch.stack(per_env, dim=0))
             return torch.stack(out, dim=0)
