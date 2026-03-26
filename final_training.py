@@ -550,6 +550,8 @@ def _collect_policy_step_stats(
         local_mass = float(loc_probs[0].item())
         es_mass = float(loc_probs[1:].sum().item())
         local_argmax = float(torch.argmax(loc_probs).item() == 0)
+        max_loc_prob = torch.max(loc_probs)
+        loc_tie = float(((loc_probs - max_loc_prob).abs() <= 1e-6).sum().item() > 1)
         return {
             "policy_local_mass": local_mass,
             "policy_es_mass": es_mass,
@@ -557,6 +559,7 @@ def _collect_policy_step_stats(
             "policy_es_pref": es_mass,
             "policy_local_argmax_share": local_argmax,
             "policy_es_argmax_share": 1.0 - local_argmax,
+            "policy_loc_tie_share": loc_tie,
         }
 
     probs = _extract_distribution_probs(distribution)
@@ -576,6 +579,8 @@ def _collect_policy_step_stats(
     row_mass = ready_pair_probs.sum(dim=1).clamp_min(1e-9)
     local_pref = ready_pair_probs[:, 0] / row_mass
     local_argmax = (ready_pair_probs.argmax(dim=1) == 0).float()
+    row_max = ready_pair_probs.max(dim=1, keepdim=True).values
+    tie_rows = ((ready_pair_probs - row_max).abs() <= 1e-6).sum(dim=1) > 1
 
     local_mass = float(ready_pair_probs[:, 0].sum().item())
     es_mass = float(ready_pair_probs[:, 1:].sum().item())
@@ -588,6 +593,7 @@ def _collect_policy_step_stats(
         "policy_es_pref": 1.0 - local_pref_avg,
         "policy_local_argmax_share": local_argmax_share,
         "policy_es_argmax_share": 1.0 - local_argmax_share,
+        "policy_loc_tie_share": float(tie_rows.float().mean().item()),
     }
 
 
@@ -837,6 +843,8 @@ def run_comparison_experiment(
         print(f"     per-ready pref(es/local) = "
               f"{results[model_type].get('policy_es_pref_avg', 0.0):.3f}/"
               f"{results[model_type].get('policy_local_pref_avg', 0.0):.3f}")
+        print(f"     loc tie share = "
+              f"{results[model_type].get('policy_loc_tie_share_avg', 0.0):.3f}")
 
     # 打印对比表
     title = "横向对比 (TransformerConv)" if "dtodrl_tf" in methods else "DTODRL vs Joint vs Two-Stage 对比结果"
@@ -855,6 +863,7 @@ def run_comparison_experiment(
               f"{r.get('policy_es_mass_avg', 0.0):.3f}/{r.get('policy_local_mass_avg', 0.0):.3f}")
         print(f"{'':12} | per-ready pref(es/local) = "
               f"{r.get('policy_es_pref_avg', 0.0):.3f}/{r.get('policy_local_pref_avg', 0.0):.3f}")
+        print(f"{'':12} | loc tie share = {r.get('policy_loc_tie_share_avg', 0.0):.3f}")
     print(f"{'='*70}\n")
 
     # 保存结果到 JSON
@@ -971,6 +980,8 @@ def run_reward_comparison_experiment(
         print(f"     policy mass(es/local) = "
               f"{results[name].get('policy_es_mass_avg', 0.0):.3f}/"
               f"{results[name].get('policy_local_mass_avg', 0.0):.3f}")
+        print(f"     loc tie share = "
+              f"{results[name].get('policy_loc_tie_share_avg', 0.0):.3f}")
 
     print(f"\n{'='*70}")
     print("奖励函数对比结果 (baseline vs improved)")
@@ -1108,6 +1119,7 @@ if __name__ == "__main__":
               f"{det_summary.get('policy_local_mass_avg', 0.0):.3f}")
         print(f"[DIAG] per-ready pref(es/local) = {det_summary.get('policy_es_pref_avg', 0.0):.3f}/"
               f"{det_summary.get('policy_local_pref_avg', 0.0):.3f}")
+        print(f"[DIAG] loc tie share = {det_summary.get('policy_loc_tie_share_avg', 0.0):.3f}")
 
         import json
         ts = time.strftime("%Y%m%d-%H%M%S")

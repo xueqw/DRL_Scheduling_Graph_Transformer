@@ -7,6 +7,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 N = 10
 K = 4
 hidden_dim = 108
+raw_loc_feature_dim = 7
 
 obs = {
     "nodes_C": torch.randn(N),
@@ -25,14 +26,16 @@ obs = {
 obs = {k: v.to(device) for k, v in obs.items()}
 
 backbone = GraphBackbone(hidden_dim=hidden_dim).to(device)
-actor = JointActor(hidden_dim=hidden_dim).to(device)
+actor = JointActor(hidden_dim=hidden_dim, raw_loc_feature_dim=raw_loc_feature_dim).to(device)
 critic = JointCritic(hidden_dim=hidden_dim).to(device)
 
 out = backbone.forward_all(obs)
+loc_raw_features = torch.zeros((N, K, raw_loc_feature_dim), device=device)
 
 logits = actor(
     node_embs=out["node_embs"],
     loc_embs=out["loc_embs"],
+    loc_raw_features=loc_raw_features,
     graph_emb=out["graph_emb"],
     loc_global_emb=out["loc_global_emb"],
 )

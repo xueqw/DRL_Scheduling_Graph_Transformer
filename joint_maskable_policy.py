@@ -75,14 +75,19 @@ class JointMaskablePolicy(MaskableActorCriticPolicy):
             gat_layers=gat_layers,
             use_cp=kwargs.get("use_cp", False),
         )
-        # Let local/ES scoring see the current UE-side queue pressure.
+        self.candidate_loc_feature_dim = 7
+        # Feed raw candidate-side signals directly into the location path so
+        # local/ES logits cannot collapse just because learned embeddings drift together.
         self.loc_context_encoder = nn.Sequential(
-            nn.Linear(3, hidden_dim),
+            nn.Linear(self.candidate_loc_feature_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        self.actor = JointActor(hidden_dim=hidden_dim)
+        self.actor = JointActor(
+            hidden_dim=hidden_dim,
+            raw_loc_feature_dim=self.candidate_loc_feature_dim,
+        )
         self.critic = JointCritic(hidden_dim=hidden_dim)
 
         self.action_net = nn.Identity()
@@ -143,7 +148,7 @@ class JointMaskablePolicy(MaskableActorCriticPolicy):
 
     def _extract_joint_latents(
         self, obs: PyTorchObs
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         统一返回 batch 版：
             node_embs:      (B, N, d)
@@ -159,28 +164,29 @@ class JointMaskablePolicy(MaskableActorCriticPolicy):
         loc_global_emb = self.backbone.pool_locations(loc_embs_raw)
 
         node_embs = self._reshape_node_embs(node_embs_raw, obs, batch=batch)
-        candidate_loc_embs = self._build_candidate_loc_embs(obs, loc_embs_raw)
+        candidate_loc_embs, candidate_loc_features = self._build_candidate_loc_embs(obs, loc_embs_raw)
 
         if graph_emb.dim() == 1:
             graph_emb = graph_emb.unsqueeze(0)
         if loc_global_emb.dim() == 1:
             loc_global_emb = loc_global_emb.unsqueeze(0)
 
-        return node_embs, candidate_loc_embs, graph_emb, loc_global_emb
+        return node_embs, candidate_loc_embs, candidate_loc_features, graph_emb, loc_global_emb
 
     def _get_action_logits(self, obs: PyTorchObs) -> torch.Tensor:
-        node_embs, loc_embs, graph_emb, loc_global_emb = self._extract_joint_latents(obs)
+        node_embs, loc_embs, loc_raw_features, graph_emb, loc_global_emb = self._extract_joint_latents(obs)
 
         logits = self.actor(
             node_embs=node_embs,
             loc_embs=loc_embs,
+            loc_raw_features=loc_raw_features,
             graph_emb=graph_emb,
             loc_global_emb=loc_global_emb,
         )
         return logits
 
     def _get_values(self, obs: PyTorchObs) -> torch.Tensor:
-        _, _, graph_emb, loc_global_emb = self._extract_joint_latents(obs)
+        _, _, _, graph_emb, loc_global_emb = self._extract_joint_latents(obs)
         values = self.critic(graph_emb, loc_global_emb)
         return values
 
@@ -241,21 +247,51 @@ class JointMaskablePolicy(MaskableActorCriticPolicy):
     def _augment_candidate_loc_embs(
         self,
         candidate_loc_embs: torch.Tensor,
+        candidate_loc_features: torch.Tensor,
+    ) -> torch.Tensor:
+        return candidate_loc_embs + self.loc_context_encoder(candidate_loc_features)
+
+    def _build_candidate_loc_features(
+        self,
+        loc_cpu_speed: torch.Tensor,
+        loc_min_processor_eat: torch.Tensor,
+        loc_num_processor: torch.Tensor,
         ue_upload_eat: torch.Tensor,
         ue_download_eat: torch.Tensor,
+        ue_id: int,
+        ue_num: int,
     ) -> torch.Tensor:
-        context = candidate_loc_embs.new_zeros((candidate_loc_embs.shape[0], 3))
-        context[0, 0] = 1.0
-        if candidate_loc_embs.shape[0] > 1:
-            context[1:, 1] = torch.log1p(ue_upload_eat.float())
-            context[1:, 2] = torch.log1p(ue_download_eat.float())
-        return candidate_loc_embs + self.loc_context_encoder(context)
+        local_cpu = loc_cpu_speed[ue_id].unsqueeze(0)
+        local_eat = loc_min_processor_eat[ue_id].unsqueeze(0)
+        local_proc = loc_num_processor[ue_id].unsqueeze(0)
+
+        es_cpu = loc_cpu_speed[ue_num:]
+        es_eat = loc_min_processor_eat[ue_num:]
+        es_proc = loc_num_processor[ue_num:]
+
+        cand_cpu = torch.cat([local_cpu, es_cpu], dim=0).float()
+        cand_eat = torch.cat([local_eat, es_eat], dim=0).float()
+        cand_proc = torch.cat([local_proc, es_proc], dim=0).float()
+
+        candidate_loc_features = cand_cpu.new_zeros(
+            (cand_cpu.shape[0], self.candidate_loc_feature_dim)
+        )
+        candidate_loc_features[0, 0] = 1.0
+        if candidate_loc_features.shape[0] > 1:
+            candidate_loc_features[1:, 1] = 1.0
+            candidate_loc_features[1:, 5] = torch.log1p(ue_upload_eat.float())
+            candidate_loc_features[1:, 6] = torch.log1p(ue_download_eat.float())
+
+        candidate_loc_features[:, 2] = torch.log1p(cand_cpu)
+        candidate_loc_features[:, 3] = torch.log1p(cand_eat)
+        candidate_loc_features[:, 4] = torch.log1p(cand_proc)
+        return candidate_loc_features
 
     def _build_candidate_loc_embs(
             self,
             obs: Dict[str, torch.Tensor],
             loc_embs: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         输入:
             obs["nodes_ue_id"]:
@@ -288,21 +324,35 @@ class JointMaskablePolicy(MaskableActorCriticPolicy):
             es_num = L - ue_num
             K = es_num + 1
 
+            loc_cpu_speed = obs["loc_cpu_speed"].float()
+            loc_min_processor_eat = obs["loc_min_processor_EAT"].float()
+            loc_num_processor = obs["loc_num_processor"].float()
+
             out = []
+            feature_out = []
             es_embs = loc_embs[ue_num:]  # (M, d)
 
             for i in range(N):
                 ue_id = int(nodes_ue_id[i].item())
                 local_emb = loc_embs[ue_id].unsqueeze(0)  # (1, d)
                 cand_i = torch.cat([local_emb, es_embs], dim=0)  # (K, d)
-                cand_i = self._augment_candidate_loc_embs(
-                    cand_i,
+                cand_features = self._build_candidate_loc_features(
+                    loc_cpu_speed,
+                    loc_min_processor_eat,
+                    loc_num_processor,
                     obs["ue_upload_EAT"][ue_id],
                     obs["ue_download_EAT"][ue_id],
+                    ue_id,
+                    ue_num,
+                )
+                cand_i = self._augment_candidate_loc_embs(
+                    cand_i,
+                    cand_features,
                 )
                 out.append(cand_i)
+                feature_out.append(cand_features)
 
-            return torch.stack(out, dim=0)  # (N, K, d)
+            return torch.stack(out, dim=0), torch.stack(feature_out, dim=0)
 
         # batch
         elif loc_embs.dim() == 3:
@@ -314,22 +364,37 @@ class JointMaskablePolicy(MaskableActorCriticPolicy):
             K = es_num + 1
 
             out = []
+            feature_out = []
             for b in range(B):
                 es_embs = loc_embs[b, ue_num:]  # (M, d)
+                loc_cpu_speed = obs["loc_cpu_speed"][b].float()
+                loc_min_processor_eat = obs["loc_min_processor_EAT"][b].float()
+                loc_num_processor = obs["loc_num_processor"][b].float()
                 per_env = []
+                per_env_features = []
                 for i in range(N):
                     ue_id = int(nodes_ue_id[b, i].item())
                     local_emb = loc_embs[b, ue_id].unsqueeze(0)  # (1, d)
                     cand_i = torch.cat([local_emb, es_embs], dim=0)  # (K, d)
-                    cand_i = self._augment_candidate_loc_embs(
-                        cand_i,
+                    cand_features = self._build_candidate_loc_features(
+                        loc_cpu_speed,
+                        loc_min_processor_eat,
+                        loc_num_processor,
                         obs["ue_upload_EAT"][b, ue_id],
                         obs["ue_download_EAT"][b, ue_id],
+                        ue_id,
+                        ue_num,
+                    )
+                    cand_i = self._augment_candidate_loc_embs(
+                        cand_i,
+                        cand_features,
                     )
                     per_env.append(cand_i)
+                    per_env_features.append(cand_features)
                 out.append(torch.stack(per_env, dim=0))  # (N, K, d)
+                feature_out.append(torch.stack(per_env_features, dim=0))
 
-            return torch.stack(out, dim=0)  # (B, N, K, d)
+            return torch.stack(out, dim=0), torch.stack(feature_out, dim=0)
 
         else:
             raise ValueError(f"Unexpected loc_embs shape: {tuple(loc_embs.shape)}")

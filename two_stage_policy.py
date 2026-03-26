@@ -1,37 +1,31 @@
 """
-Two-Stage 方法策略模块
-
-将决策分解为两阶段：
-  Stage 1: 选择任务 (Node)   π₁(i|s) = Softmax(f₁(s,i))
-  Stage 2: 选择资源 (Location) π₂(j|i,r) = Softmax(f₂(i,r,j))
-  联合概率: π(a) = π(i,j) = π₁(i|s) * π₂(j|i,r)
-  log π(a) = log π₁(i) + log π₂(j|i)
+Two-stage policy helpers.
 """
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
 
 
 class TwoStageActor(nn.Module):
     """
-    两阶段打分网络：
-    - f₁(s,i): 任务选择得分 -> π₁(i|s)
-    - f₂(i,r,j): 资源选择得分 -> π₂(j|i,r)
+    Factorized policy:
+    - stage 1 chooses a node
+    - stage 2 chooses a location for that node
     """
 
-    def __init__(self, hidden_dim: int):
+    def __init__(self, hidden_dim: int, raw_loc_feature_dim: int = 0):
         super().__init__()
-        # Stage 1: 任务选择 f₁(s,i), 输入 node_ctx (B,N,3d)
+        self.raw_loc_feature_dim = raw_loc_feature_dim
         self.node_score_mlp = nn.Sequential(
             nn.Linear(hidden_dim * 3, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, 1),
         )
-        # Stage 2: 资源选择 f₂(i,r,j), 输入 (node_i, loc_j, resource_ctx)
         self.loc_score_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 4, hidden_dim),
+            nn.Linear(hidden_dim * 4 + raw_loc_feature_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, 1),
@@ -41,65 +35,77 @@ class TwoStageActor(nn.Module):
         self,
         node_embs: torch.Tensor,
         loc_embs: torch.Tensor,
+        loc_raw_features: torch.Tensor,
         graph_emb: torch.Tensor,
         loc_global_emb: torch.Tensor,
         action_masks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        输出联合 logits (B, N*K)，满足 log π(a) = log π₁(i) + log π₂(j|i)
-
-        action_masks: (N*K,) 或 (B, N*K)，True 表示 (node_i, loc_j) 合法
+        Return flattened joint logits with
+        log p(node, loc) = log p(node) + log p(loc | node).
         """
         squeeze_batch = False
         if node_embs.dim() == 2:
             node_embs = node_embs.unsqueeze(0)
             loc_embs = loc_embs.unsqueeze(0)
+            loc_raw_features = loc_raw_features.unsqueeze(0)
             if graph_emb.dim() == 1:
                 graph_emb = graph_emb.unsqueeze(0)
             if loc_global_emb.dim() == 1:
                 loc_global_emb = loc_global_emb.unsqueeze(0)
             squeeze_batch = True
 
-        B, N, d = node_embs.shape
-        _, _, K, _ = loc_embs.shape
+        bsz, num_nodes, hidden_dim = node_embs.shape
+        bsz2, num_nodes2, num_locations, hidden_dim2 = loc_embs.shape
+        bsz3, num_nodes3, num_locations2, raw_dim = loc_raw_features.shape
 
-        # ----- Stage 1: f₁(s,i) 任务选择得分 -----
-        graph_ctx = graph_emb.unsqueeze(1).expand(B, N, d)
-        loc_ctx = loc_global_emb.unsqueeze(1).expand(B, N, d)
-        node_ctx = torch.cat([node_embs, graph_ctx, loc_ctx], dim=-1)  # (B,N,3d)
-        node_scores = self.node_score_mlp(node_ctx).squeeze(-1)  # (B,N)
+        if not (
+            bsz == bsz2 == bsz3
+            and num_nodes == num_nodes2 == num_nodes3
+            and num_locations == num_locations2
+            and hidden_dim == hidden_dim2
+        ):
+            raise ValueError(
+                f"shape mismatch: node_embs={tuple(node_embs.shape)}, "
+                f"loc_embs={tuple(loc_embs.shape)}, "
+                f"loc_raw_features={tuple(loc_raw_features.shape)}"
+            )
+        if raw_dim != self.raw_loc_feature_dim:
+            raise ValueError(
+                f"loc_raw_features last dim mismatch: got {raw_dim}, expected {self.raw_loc_feature_dim}"
+            )
 
-        # ----- Stage 2: f₂(i,r,j) 资源选择得分 -----
-        node_ctx_exp = node_ctx.unsqueeze(2).expand(B, N, K, 3 * d)
-        pair_feat = torch.cat([node_ctx_exp, loc_embs], dim=-1)  # (B,N,K,4d)
-        loc_scores = self.loc_score_mlp(pair_feat).squeeze(-1)  # (B,N,K)
+        graph_ctx = graph_emb.unsqueeze(1).expand(bsz, num_nodes, hidden_dim)
+        loc_ctx = loc_global_emb.unsqueeze(1).expand(bsz, num_nodes, hidden_dim)
+        node_ctx = torch.cat([node_embs, graph_ctx, loc_ctx], dim=-1)
+        node_scores = self.node_score_mlp(node_ctx).squeeze(-1)
 
-        # ----- 解析 action mask -----
+        node_ctx_exp = node_ctx.unsqueeze(2).expand(bsz, num_nodes, num_locations, 3 * hidden_dim)
+        pair_feat = torch.cat([node_ctx_exp, loc_embs, loc_raw_features], dim=-1)
+        loc_scores = self.loc_score_mlp(pair_feat).squeeze(-1)
+
         if action_masks is not None:
             if action_masks.dim() == 1:
                 action_masks = action_masks.unsqueeze(0)
-            # pair_mask[b,i,j] = mask[b, i*K+j]
-            pair_mask = action_masks.reshape(B, N, K)
-            node_mask = pair_mask.any(dim=2)  # (B,N), 至少有一个 loc 合法的 node
+            pair_mask = action_masks.reshape(bsz, num_nodes, num_locations)
+            node_mask = pair_mask.any(dim=2)
         else:
-            pair_mask = torch.ones(B, N, K, dtype=torch.bool, device=node_embs.device)
-            node_mask = torch.ones(B, N, dtype=torch.bool, device=node_embs.device)
+            pair_mask = torch.ones(
+                bsz, num_nodes, num_locations, dtype=torch.bool, device=node_embs.device
+            )
+            node_mask = torch.ones(bsz, num_nodes, dtype=torch.bool, device=node_embs.device)
 
-        # ----- π₁(i|s) = Softmax(f₁) over valid nodes -----
         node_scores_masked = node_scores.masked_fill(~node_mask, -1e9)
-        log_pi1 = F.log_softmax(node_scores_masked, dim=1)  # (B,N)
+        log_pi1 = F.log_softmax(node_scores_masked, dim=1)
 
-        # ----- π₂(j|i,r) = Softmax(f₂) over valid locs for each i -----
         loc_scores_masked = loc_scores.masked_fill(~pair_mask, -1e9)
-        log_pi2 = F.log_softmax(loc_scores_masked, dim=2)  # (B,N,K)
+        log_pi2 = F.log_softmax(loc_scores_masked, dim=2)
 
-        # ----- log π(a) = log π₁(i) + log π₂(j|i), a = i*K+j -----
-        log_joint = log_pi1.unsqueeze(2) + log_pi2  # (B,N,K)
-        logits = log_joint.reshape(B, N * K)
+        log_joint = log_pi1.unsqueeze(2) + log_pi2
+        logits = log_joint.reshape(bsz, num_nodes * num_locations)
 
-        # 无效动作置为极小值，后续 apply_masking 会再次处理
         if action_masks is not None:
-            flat_mask = action_masks.reshape(B, N * K)
+            flat_mask = action_masks.reshape(bsz, num_nodes * num_locations)
             logits = logits.masked_fill(~flat_mask, -1e9)
 
         if squeeze_batch:

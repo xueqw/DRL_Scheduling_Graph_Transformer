@@ -196,7 +196,11 @@ Current comparison outputs also record:
 
 These metrics help detect whether a policy collapses to all-local or all-ES assignment.
 
-Recent diagnostics also include deterministic vs stochastic ratios and policy-side local/ES probability mass, which are useful for checking whether collapse comes from the learned distribution itself or only from greedy action selection.
+Recent diagnostics also include deterministic vs stochastic ratios, policy-side local/ES probability mass, and `policy_loc_tie_share_avg`.
+
+- If `policy_loc_tie_share_avg` is close to `1.0`, the location head is producing ties for many ready nodes.
+- In that case, deterministic evaluation will often fall back to location index `0` first, which is the local option in this environment.
+- This is different from a true local preference. Check `policy_local_pref_avg` / `policy_es_pref_avg` together with `policy_loc_tie_share_avg`.
 
 ## 7. TensorBoard
 
@@ -252,3 +256,39 @@ python smoke_test.py
 python final_training.py joint
 tensorboard --logdir runs
 ```
+
+## 11. Reproducing The Latest Collapse Check
+
+If you are validating the latest `main`, do not start with the full comparison run.
+
+Recommended order:
+
+```bash
+git pull origin main
+python final_training.py joint
+python final_training.py two_stage
+python final_training.py dtodrl
+```
+
+After each single-method run, keep these files:
+
+- `runs/DTO_DRL_<method>_<timestamp>/final_model.zip`
+- `runs/DTO_DRL_<method>_<timestamp>/policy_diagnosis_*.json`
+- TensorBoard event files under the same run directory
+
+The most useful fields in `policy_diagnosis_*.json` are:
+
+- `deterministic.es_ratio_avg` / `deterministic.local_ratio_avg`
+- `stochastic.es_ratio_avg` / `stochastic.local_ratio_avg`
+- `deterministic.policy_es_mass_avg` / `deterministic.policy_local_mass_avg`
+- `deterministic.policy_es_pref_avg` / `deterministic.policy_local_pref_avg`
+- `deterministic.policy_loc_tie_share_avg`
+
+How to read them quickly:
+
+- `deterministic` all-local or all-ES but `stochastic` is not:
+  greedy action selection is amplifying a mild bias.
+- `policy_loc_tie_share_avg` close to `1.0`:
+  the location logits are tying, so deterministic decoding is not trustworthy by itself.
+- `policy_es_mass_avg` close to `1.0` and `policy_loc_tie_share_avg` low:
+  the policy distribution itself is really collapsing to ES.
