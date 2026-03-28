@@ -59,6 +59,7 @@ class DTODRLMaskablePolicy(MaskableActorCriticPolicy):
         freeze_pretrained_gat: bool = True,
         use_transformer_backbone: bool = False,
         hidden_dim: int = 108,
+        use_cp: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -79,9 +80,9 @@ class DTODRLMaskablePolicy(MaskableActorCriticPolicy):
                 node_feature_dim=6,
                 location_feature_dim=3,
                 hidden_dim=hidden_dim,
-                gat_heads=kwargs.get("gat_heads", 4),
-                gat_layers=kwargs.get("gat_layers", 3),
-                use_cp=kwargs.get("use_cp", False),
+                gat_heads=gat_heads,
+                gat_layers=gat_layers,
+                use_cp=use_cp,
             )
             actor_hidden_dim = hidden_dim
         else:

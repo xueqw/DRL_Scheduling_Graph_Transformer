@@ -1,6 +1,7 @@
 import copy
 import os
 import time
+import json
 from dataclasses import dataclass
 from typing import Callable, Optional, Dict, Tuple, List
 
@@ -36,6 +37,26 @@ from Graph_policy import GraphDictFeaturesExtractor
 from joint_maskable_policy import JointMaskablePolicy
 from two_stage_maskable_policy import TwoStageMaskablePolicy
 from dtodrl_maskable_policy import DTODRLMaskablePolicy
+
+
+def _debug_log(hypothesis_id: str, location: str, message: str, data: Dict) -> None:
+    # region agent log
+    open("/opt/cursor/logs/debug.log", "a", encoding="utf-8").write(
+        json.dumps(
+            {
+                "hypothesisId": hypothesis_id,
+                "location": location,
+                "message": message,
+                "data": data,
+                "timestamp": int(time.time() * 1000),
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+        + "\n"
+    )
+    # endregion
+
 
 class PrintEpisodeReturnCallback(BaseCallback):
     def __init__(self, verbose=0):
@@ -358,6 +379,8 @@ def build_env_from_dag_case(
         *,
         reward_oracle: str = "greedy",
         reward_scale: bool = True,
+        case_generator: Optional[Callable[[], DAGCase]] = None,
+        refresh_case_on_reset: bool = False,
 ):
     """
     独立建立env
@@ -412,7 +435,13 @@ def build_env_from_dag_case(
     )
 
     # Env
-    return DTOEnv(scheduler, reward_oracle=reward_oracle, reward_scale=reward_scale)
+    return DTOEnv(
+        scheduler,
+        reward_oracle=reward_oracle,
+        reward_scale=reward_scale,
+        case_generator=case_generator,
+        refresh_case_on_reset=refresh_case_on_reset,
+    )
 
 def make_dto_env_controller(
         ue_number: int,
@@ -428,20 +457,24 @@ def make_dto_env_controller(
         *,
         reward_oracle: str = "greedy",
         reward_scale: bool = True,
+        refresh_case_on_reset: bool = True,
 ):
     # 以seed0为基准 创建 (seed0+i) 的controller
     counter = {"i": 0}
 
-    def _controller():
+    def _next_case() -> DAGCase:
         index = counter["i"]
         counter["i"] += 1
 
-        case = make_dag_case(
+        return make_dag_case(
             ue_number=ue_number,
             n_compute_nodes_per_ue=n_compute_nodes_per_ue,
             start_count_max=start_count_max,
             seed=seed0 + index,
         )
+
+    def _controller():
+        case = _next_case()
 
         return build_env_from_dag_case(
             case=case,
@@ -454,6 +487,8 @@ def make_dto_env_controller(
             tr_es_es=tr_es_es,
             reward_oracle=reward_oracle,
             reward_scale=reward_scale,
+            case_generator=_next_case if refresh_case_on_reset else None,
+            refresh_case_on_reset=refresh_case_on_reset,
         )
     return _controller
 
@@ -628,11 +663,25 @@ def run_rl_episode_vec(venv: VecEnv, model: MaskablePPO, deterministic: bool = T
     if isinstance(obs, tuple):
         obs = obs[0]
     steps = 0
+    reward_sum = 0.0
     dones = [False]
     step_infos = []
     policy_step_stats = []
     last_info = None
     base_env = _get_base_env(venv.envs[0])
+    # region agent log
+    _debug_log(
+        "A",
+        "final_training.py:run_rl_episode_vec:entry",
+        "RL episode vec entry",
+        {
+            "deterministic": bool(deterministic),
+            "ready_count": len(base_env.ready_nodes()),
+            "vec_type": type(venv).__name__,
+            "has_vecnormalize": bool(hasattr(venv, "obs_rms")),
+        },
+    )
+    # endregion
 
     while not dones[0]:
         masks = venv.envs[0].action_masks()
@@ -642,7 +691,22 @@ def run_rl_episode_vec(venv: VecEnv, model: MaskablePPO, deterministic: bool = T
         action, _ = model.predict(obs, action_masks=masks, deterministic=deterministic)
         if isinstance(action, np.ndarray):
             action = action.reshape(-1)
+        if steps < 3:
+            # region agent log
+            _debug_log(
+                "A",
+                "final_training.py:run_rl_episode_vec:pre_step",
+                "RL step action/mask snapshot",
+                {
+                    "step": steps,
+                    "valid_action_count": int(np.sum(np.asarray(masks, dtype=np.int32))),
+                    "mask_size": int(len(masks)),
+                    "action": np.asarray(action).astype(int).tolist(),
+                },
+            )
+            # endregion
         obs, rewards, dones, infos = venv.step(action)
+        reward_sum += float(np.asarray(rewards).reshape(-1)[0])
         if infos:
             last_info = infos[0]
             step_info = last_info.get("step_info")
@@ -661,6 +725,21 @@ def run_rl_episode_vec(venv: VecEnv, model: MaskablePPO, deterministic: bool = T
     makespan = float(np.max(ue_finish))
     episode_stats = _summarize_offload(step_infos)
     episode_stats.update(_summarize_policy_step_stats(policy_step_stats))
+    # region agent log
+    _debug_log(
+        "C",
+        "final_training.py:run_rl_episode_vec:exit",
+        "RL episode vec exit",
+        {
+            "steps": steps,
+            "reward_sum": reward_sum,
+            "mean_aft": mean_aft,
+            "makespan": makespan,
+            "es_ratio": episode_stats.get("es_ratio"),
+            "local_ratio": episode_stats.get("local_ratio"),
+        },
+    )
+    # endregion
     return mean_aft, makespan, steps, episode_stats
 
 def run_baseline_episode(env, node_rule: "str"):
@@ -673,6 +752,17 @@ def run_baseline_episode(env, node_rule: "str"):
     obs, _ = env.reset()
     steps = 0
     node_id = None
+    # region agent log
+    _debug_log(
+        "E",
+        "final_training.py:run_baseline_episode:entry",
+        "Baseline episode entry",
+        {
+            "node_rule": node_rule,
+            "ready_count": len(env.ready_nodes()),
+        },
+    )
+    # endregion
 
     while not env.done():
         ready = env.ready_nodes()
@@ -686,12 +776,39 @@ def run_baseline_episode(env, node_rule: "str"):
         elif node_rule == "ljf":
             node_id = max(ready, key=lambda nid: env.scheduler.nodes[nid].C)
 
+        if steps < 3:
+            # region agent log
+            _debug_log(
+                "E",
+                "final_training.py:run_baseline_episode:pre_step",
+                "Baseline step snapshot",
+                {
+                    "step": steps,
+                    "node_rule": node_rule,
+                    "chosen_node_id": int(node_id),
+                    "ready_count": len(ready),
+                },
+            )
+            # endregion
         env.step_greedy(node_id)
         steps += 1
 
     ue_finish = list(env.scheduler.download_EAT.values())
     mean_aft = float(np.mean(ue_finish))
     makespan = float(np.max(ue_finish))
+    # region agent log
+    _debug_log(
+        "E",
+        "final_training.py:run_baseline_episode:exit",
+        "Baseline episode exit",
+        {
+            "node_rule": node_rule,
+            "steps": steps,
+            "mean_aft": mean_aft,
+            "makespan": makespan,
+        },
+    )
+    # endregion
     return mean_aft, makespan, steps
 
 
@@ -713,6 +830,23 @@ def _build_eval_vec_env(case: DAGCase, dag_cfg: DAGConfig, norm_path: str):
     if os.path.exists(norm_path):
         venv = VecNormalize.load(norm_path, venv)
         venv.training = False
+        # region agent log
+        _debug_log(
+            "B",
+            "final_training.py:_build_eval_vec_env",
+            "Loaded VecNormalize for eval",
+            {"norm_path": norm_path, "exists": True},
+        )
+        # endregion
+    else:
+        # region agent log
+        _debug_log(
+            "B",
+            "final_training.py:_build_eval_vec_env",
+            "VecNormalize missing for eval",
+            {"norm_path": norm_path, "exists": False},
+        )
+        # endregion
     return venv
 
 

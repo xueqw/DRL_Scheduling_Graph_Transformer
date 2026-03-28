@@ -167,6 +167,37 @@ class DTOScheduler:
         self.download_trace: list[tuple[int, int, float, float]] = []
         # (ue_id, node_id, download_start, download_finish)
 
+    def load_case(
+            self,
+            nodes: Dict[int, Node],
+            edges_data: Dict[Tuple[int, int], float],
+            end_nodes: List[int],
+            download_nodes: List[int],
+    ) -> None:
+        """
+        Replace the DAG case while keeping location/system settings unchanged.
+        Runtime scheduling state is reset together.
+        """
+        self.nodes = nodes
+        self.edges_data = edges_data
+        self.end_nodes = end_nodes
+        self.download_nodes = download_nodes
+
+        self.aft.clear()
+        self.node_loc.clear()
+
+        for ue in self.upload_EAT:
+            self.upload_EAT[ue] = 0.0
+            self.download_EAT[ue] = 0.0
+
+        for loc in self.locations:
+            for p in loc.processors:
+                p.EAT = 0.0
+
+        self.trace.clear()
+        self.download_trace.clear()
+        self._step_counter = 0
+
     def physical_eat(self, loc, node, node_id, ue_id):
         """
 

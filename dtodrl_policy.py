@@ -58,6 +58,24 @@ class TwoHeadMaskableCategoricalDistribution(MaskableDistribution):
         # The DTODRL paper applies a mask only on the node head.
         pass
 
+    def actions_from_params(
+        self,
+        node_scores_masked: torch.Tensor,
+        loc_scores: torch.Tensor,
+        deterministic: bool = False,
+    ) -> torch.Tensor:
+        self.proba_distribution(node_scores_masked=node_scores_masked, loc_scores=loc_scores)
+        return self.get_actions(deterministic=deterministic)
+
+    def log_prob_from_params(
+        self,
+        node_scores_masked: torch.Tensor,
+        loc_scores: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        actions = self.actions_from_params(node_scores_masked=node_scores_masked, loc_scores=loc_scores)
+        log_prob = self.log_prob(actions)
+        return actions, log_prob
+
 
 class DTODRLActor(nn.Module):
     """

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Set, Dict, List, Tuple, Optional
+from typing import Set, Dict, List, Tuple, Optional, Callable
 
 import numpy as np
 from gensim.models import FastText
@@ -28,6 +28,9 @@ class DTOEnv(gym.Env):
         *,
         reward_oracle: str = "greedy",
         reward_scale: bool = True,
+        case_generator: Optional[Callable[[], object]] = None,
+        refresh_case_on_reset: bool = False,
+        greedy_location_mask_only: bool = True,
     ):
         """
         reward_oracle: "local" (baseline 全部本地) | "greedy" (每步选最优 loc)
@@ -39,6 +42,10 @@ class DTOEnv(gym.Env):
         self.es_numbers = scheduler.es_numbers
         self.reward_oracle = reward_oracle
         self.reward_scale = reward_scale
+        self._case_generator = case_generator
+        self._refresh_case_on_reset = refresh_case_on_reset
+        self._reset_count = 0
+        self._greedy_location_mask_only = greedy_location_mask_only
 
         """以下为内部状态(内部频繁更改)"""
         self._unscheduled: set[int] = set()
@@ -85,6 +92,29 @@ class DTOEnv(gym.Env):
         })
 
         self.prev_mean_eft = 0.0
+
+    def set_case_generator(
+        self,
+        case_generator: Callable[[], object],
+        *,
+        refresh_on_reset: bool = True,
+    ) -> None:
+        self._case_generator = case_generator
+        self._refresh_case_on_reset = refresh_on_reset
+
+    def _maybe_refresh_dag_case(self):
+        if (
+            self._refresh_case_on_reset
+            and self._case_generator is not None
+            and self._reset_count > 0
+        ):
+            case = self._case_generator()
+            self.scheduler.load_case(
+                nodes=case.nodes,
+                edges_data=case.edges_data,
+                end_nodes=case.end_nodes,
+                download_nodes=case.download_nodes,
+            )
 
     def build_action_mask(self):
         """
@@ -238,6 +268,9 @@ class DTOEnv(gym.Env):
             _step_counter
         """
         scheduler = self.scheduler
+        self._maybe_refresh_dag_case()
+        self._reset_count += 1
+        self.end_nodes = set(getattr(scheduler, "end_nodes", []))
 
         # 未调度节点初始化 去除end_nodes
         self._unscheduled = {node for node in scheduler.nodes.keys() if node not in self.end_nodes}
@@ -279,11 +312,18 @@ class DTOEnv(gym.Env):
             self.prev_mean_eft = self.scheduler.estimate_complete_mean_eft_by_copy(
                 unscheduled=self._unscheduled,
             )
+        # 兼容 step_greedy 的 reward 计算（baseline 路径会走到）
+        self.prev_makespan = 0.0
 
         # ===== 每个 episode 换 DAG：重建 node_ids / adj =====
-        self.end_nodes = set(getattr(scheduler, "end_nodes", []))
         self.node_ids = sorted(nid for nid in scheduler.nodes.keys() if nid not in self.end_nodes)
         self.N = len(self.node_ids)
+        expected_nodes = self.action_space.n // (self.es_numbers + 1)
+        if self.N != expected_nodes:
+            raise ValueError(
+                f"DAG node count changed from {expected_nodes} to {self.N}. "
+                "Use a fixed n_compute_nodes_per_ue across resets."
+            )
 
         self.id2idx = {nid: i for i, nid in enumerate(self.node_ids)}
 
@@ -337,9 +377,27 @@ class DTOEnv(gym.Env):
 
         for node_id in self._ready_list:
             node_index = self.node_ids.index(node_id)
-            for loc_choice in range(K):
-                a = node_index * K + loc_choice
+            if self._greedy_location_mask_only:
+                best_loc_choice = 0
+                best_finish_time = float("inf")
+                node = self.scheduler.nodes[node_id]
+                for loc_choice in range(K):
+                    loc = self.scheduler.action_mapping(node.ue_id, loc_choice)
+                    _, _, _, finish_time, _, _, _, _, _ = self.scheduler.physical_eat(
+                        loc=loc,
+                        node=node,
+                        node_id=node_id,
+                        ue_id=node.ue_id,
+                    )
+                    if finish_time < best_finish_time:
+                        best_finish_time = finish_time
+                        best_loc_choice = loc_choice
+                a = node_index * K + best_loc_choice
                 mask[a] = True
+            else:
+                for loc_choice in range(K):
+                    a = node_index * K + loc_choice
+                    mask[a] = True
 
         return mask
 
