@@ -53,6 +53,7 @@ class JointMaskablePolicy(MaskableActorCriticPolicy):
         hidden_dim: int = 108,
         gat_heads: int = 4,
         gat_layers: int = 3,
+        use_cp: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -73,7 +74,7 @@ class JointMaskablePolicy(MaskableActorCriticPolicy):
             hidden_dim=hidden_dim,
             gat_heads=gat_heads,
             gat_layers=gat_layers,
-            use_cp=kwargs.get("use_cp", False),
+            use_cp=use_cp,
         )
         self.candidate_loc_feature_dim = 7
         # Feed raw candidate-side signals directly into the location path so

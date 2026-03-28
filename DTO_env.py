@@ -279,6 +279,8 @@ class DTOEnv(gym.Env):
             self.prev_mean_eft = self.scheduler.estimate_complete_mean_eft_by_copy(
                 unscheduled=self._unscheduled,
             )
+        # 兼容 step_greedy 的 reward 计算（baseline 路径会走到）
+        self.prev_makespan = 0.0
 
         # ===== 每个 episode 换 DAG：重建 node_ids / adj =====
         self.end_nodes = set(getattr(scheduler, "end_nodes", []))
