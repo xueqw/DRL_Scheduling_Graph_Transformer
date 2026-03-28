@@ -1,0 +1,13 @@
+torch
+torchvision
+torchaudio
+torch-geometric
+stable-baselines3==2.4.0
+sb3-contrib==2.4.0
+gymnasium>=0.29.1,<1.1.0
+tensorboard
+numpy<2.0
+gensim
+matplotlib
+networkx
+rich

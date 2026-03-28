@@ -64,6 +64,7 @@ class TwoStageMaskablePolicy(MaskableActorCriticPolicy):
         gat_layers: int = 3,
         **kwargs,
     ):
+        _use_cp = kwargs.pop("use_cp", False)
         super().__init__(
             observation_space,
             action_space,
@@ -82,7 +83,7 @@ class TwoStageMaskablePolicy(MaskableActorCriticPolicy):
             hidden_dim=hidden_dim,
             gat_heads=gat_heads,
             gat_layers=gat_layers,
-            use_cp=kwargs.get("use_cp", False),
+            use_cp=_use_cp,
         )
         self.candidate_loc_feature_dim = 7
         # Feed raw candidate-side signals directly into the location path so

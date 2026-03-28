@@ -61,6 +61,9 @@ class DTODRLMaskablePolicy(MaskableActorCriticPolicy):
         hidden_dim: int = 108,
         **kwargs,
     ):
+        _use_cp = kwargs.pop("use_cp", False)
+        _tf_gat_heads = kwargs.pop("gat_heads", 4)
+        _tf_gat_layers = kwargs.pop("gat_layers", 3)
         super().__init__(
             observation_space,
             action_space,
@@ -79,9 +82,9 @@ class DTODRLMaskablePolicy(MaskableActorCriticPolicy):
                 node_feature_dim=6,
                 location_feature_dim=3,
                 hidden_dim=hidden_dim,
-                gat_heads=kwargs.get("gat_heads", 4),
-                gat_layers=kwargs.get("gat_layers", 3),
-                use_cp=kwargs.get("use_cp", False),
+                gat_heads=_tf_gat_heads,
+                gat_layers=_tf_gat_layers,
+                use_cp=_use_cp,
             )
             actor_hidden_dim = hidden_dim
         else:
