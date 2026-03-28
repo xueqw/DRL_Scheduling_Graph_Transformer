@@ -379,6 +379,8 @@ def build_env_from_dag_case(
         *,
         reward_oracle: str = "greedy",
         reward_scale: bool = True,
+        case_generator: Optional[Callable[[], DAGCase]] = None,
+        refresh_case_on_reset: bool = False,
 ):
     """
     独立建立env
@@ -433,7 +435,13 @@ def build_env_from_dag_case(
     )
 
     # Env
-    return DTOEnv(scheduler, reward_oracle=reward_oracle, reward_scale=reward_scale)
+    return DTOEnv(
+        scheduler,
+        reward_oracle=reward_oracle,
+        reward_scale=reward_scale,
+        case_generator=case_generator,
+        refresh_case_on_reset=refresh_case_on_reset,
+    )
 
 def make_dto_env_controller(
         ue_number: int,
@@ -449,20 +457,24 @@ def make_dto_env_controller(
         *,
         reward_oracle: str = "greedy",
         reward_scale: bool = True,
+        refresh_case_on_reset: bool = True,
 ):
     # 以seed0为基准 创建 (seed0+i) 的controller
     counter = {"i": 0}
 
-    def _controller():
+    def _next_case() -> DAGCase:
         index = counter["i"]
         counter["i"] += 1
 
-        case = make_dag_case(
+        return make_dag_case(
             ue_number=ue_number,
             n_compute_nodes_per_ue=n_compute_nodes_per_ue,
             start_count_max=start_count_max,
             seed=seed0 + index,
         )
+
+    def _controller():
+        case = _next_case()
 
         return build_env_from_dag_case(
             case=case,
@@ -475,6 +487,8 @@ def make_dto_env_controller(
             tr_es_es=tr_es_es,
             reward_oracle=reward_oracle,
             reward_scale=reward_scale,
+            case_generator=_next_case if refresh_case_on_reset else None,
+            refresh_case_on_reset=refresh_case_on_reset,
         )
     return _controller
 
