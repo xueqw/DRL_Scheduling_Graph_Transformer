@@ -665,11 +665,11 @@ def run_rl_episode_vec(venv: VecEnv, model: MaskablePPO, deterministic: bool = T
 
 def run_baseline_episode(env, node_rule: "str"):
     """
-        node_rule: "topo" | "spt" | "lpt"
-        - topo: ready里选最小id
-        - sjf: ready里选C最小（短作业优先）
-        - ljf: ready里选C最大（长作业优先）
-        """
+    node_rule: "topo" | "sjf" | "ljf"
+    - topo: ready里选最小id
+    - sjf: ready里选C最小（短作业优先）
+    - ljf: ready里选C最大（长作业优先）
+    """
     obs, _ = env.reset()
     steps = 0
     node_id = None
@@ -685,6 +685,8 @@ def run_baseline_episode(env, node_rule: "str"):
             node_id = min(ready, key=lambda nid: env.scheduler.nodes[nid].C)
         elif node_rule == "ljf":
             node_id = max(ready, key=lambda nid: env.scheduler.nodes[nid].C)
+        else:
+            raise ValueError(f"Unsupported node_rule={node_rule}, use topo/sjf/ljf")
 
         env.step_greedy(node_id)
         steps += 1
@@ -724,18 +726,24 @@ def evaluate_trained_model(
     n_eval_seeds: int = 30,
     deterministic: bool = True,
     seed_base: int = 1000,
+    eval_cases: Optional[List[DAGCase]] = None,
 ) -> Dict[str, float]:
     mean_aft_list: List[float] = []
     makespan_list: List[float] = []
     metric_lists: Dict[str, List[float]] = {}
 
-    for s in range(n_eval_seeds):
-        case = make_dag_case(
-            ue_number=dag_cfg.ue_numbers,
-            n_compute_nodes_per_ue=20,
-            start_count_max=3,
-            seed=seed_base + s,
-        )
+    if eval_cases is None:
+        eval_cases = [
+            make_dag_case(
+                ue_number=dag_cfg.ue_numbers,
+                n_compute_nodes_per_ue=20,
+                start_count_max=3,
+                seed=seed_base + s,
+            )
+            for s in range(n_eval_seeds)
+        ]
+
+    for case in eval_cases:
         venv = _build_eval_vec_env(case, dag_cfg, norm_path)
         mean_aft, makespan, _, episode_stats = run_rl_episode_vec(
             venv,
@@ -756,6 +764,231 @@ def evaluate_trained_model(
     }
     summary.update(_summarize_metric_lists(metric_lists))
     return summary
+
+
+def build_fixed_eval_cases(
+    dag_cfg: DAGConfig,
+    *,
+    n_eval_seeds: int = 30,
+    seed_base: int = 1000,
+) -> List[DAGCase]:
+    return [
+        make_dag_case(
+            ue_number=dag_cfg.ue_numbers,
+            n_compute_nodes_per_ue=20,
+            start_count_max=3,
+            seed=seed_base + s,
+        )
+        for s in range(n_eval_seeds)
+    ]
+
+
+def evaluate_greedy_baseline_on_cases(
+    eval_cases: List[DAGCase],
+    dag_cfg: DAGConfig,
+    *,
+    node_rule: str = "topo",
+) -> Dict[str, float]:
+    mean_aft_list: List[float] = []
+    makespan_list: List[float] = []
+    step_list: List[float] = []
+
+    for case in eval_cases:
+        env = build_env_from_dag_case(
+            case=case,
+            ue_number=dag_cfg.ue_numbers,
+            es_number=dag_cfg.es_numbers,
+            f_ue=dag_cfg.f_ue,
+            f_es=dag_cfg.f_es,
+            es_processors=4,
+            tr_ue_es=dag_cfg.tr_ue_es,
+            tr_es_es=dag_cfg.tr_es_es,
+            reward_oracle=getattr(dag_cfg, "reward_oracle", "greedy"),
+            reward_scale=getattr(dag_cfg, "reward_scale", True),
+        )
+        mean_aft, makespan, steps = run_baseline_episode(env, node_rule=node_rule)
+        mean_aft_list.append(mean_aft)
+        makespan_list.append(makespan)
+        step_list.append(float(steps))
+
+    return {
+        "mean_AFT_avg": float(np.mean(mean_aft_list)),
+        "mean_AFT_std": float(np.std(mean_aft_list)),
+        "makespan_avg": float(np.mean(makespan_list)),
+        "makespan_std": float(np.std(makespan_list)),
+        "steps_avg": float(np.mean(step_list)),
+        "steps_std": float(np.std(step_list)),
+    }
+
+
+def run_long_horizon_vs_greedy_experiment(
+    train_cfg: TrainConfig,
+    dag_cfg: DAGConfig,
+    *,
+    model_type: str = "joint",
+    training_stages: Optional[List[int]] = None,
+    n_eval_seeds: int = 30,
+    seed_base: int = 5000,
+    baseline_rule: str = "topo",
+):
+    """
+    长程实验：检查 PPO 是否在固定测试集上超过 greedy baseline。
+    - 固定同一批随机 DAG 做阶段评估，避免“训练后测试集变化”带来的噪声。
+    - 结论口径：mean_AFT 和 makespan 都低于 baseline 视为“超过”。
+    """
+    if training_stages is None:
+        training_stages = [20_000, 50_000, 100_000]
+
+    unique_stages = sorted({int(s) for s in training_stages if int(s) > 0})
+    if not unique_stages:
+        raise ValueError("training_stages must contain positive integers")
+
+    eval_cases = build_fixed_eval_cases(
+        dag_cfg,
+        n_eval_seeds=n_eval_seeds,
+        seed_base=seed_base,
+    )
+    baseline_summary = evaluate_greedy_baseline_on_cases(
+        eval_cases,
+        dag_cfg,
+        node_rule=baseline_rule,
+    )
+    print(
+        f"[GREEDY BASELINE] rule={baseline_rule} "
+        f"meanAFT={baseline_summary['mean_AFT_avg']:.6f}, "
+        f"makespan={baseline_summary['makespan_avg']:.6f}"
+    )
+
+    train_cfg_copy = copy.deepcopy(train_cfg)
+    train_cfg_copy.runtime = f"DTO_DRL_{model_type}_long_greedy"
+
+    rl_train_controller = make_dto_env_controller(
+        ue_number=dag_cfg.ue_numbers,
+        es_number=dag_cfg.es_numbers,
+        n_compute_nodes_per_ue=20,
+        start_count_max=3,
+        f_ue=dag_cfg.f_ue,
+        f_es=dag_cfg.f_es,
+        es_processors=4,
+        tr_ue_es=dag_cfg.tr_ue_es,
+        tr_es_es=dag_cfg.tr_es_es,
+        reward_oracle=getattr(dag_cfg, "reward_oracle", "greedy"),
+        reward_scale=getattr(dag_cfg, "reward_scale", True),
+    )
+
+    trainer = DTODRLTrainer(config=train_cfg_copy, env_controller=rl_train_controller)
+    trainer.build_vec_env()
+    trainer.build_model(model_type=model_type)
+    model = trainer.model
+    if model is None:
+        raise RuntimeError("model build failed")
+
+    run_dic = trainer.run_dic
+    norm_path = os.path.join(run_dic, "vecnormalize.pkl")
+    current_steps = 0
+    stage_results: Dict[str, Dict[str, float]] = {}
+
+    for stage_steps in unique_stages:
+        delta = stage_steps - current_steps
+        if delta <= 0:
+            continue
+        print(f"\n{'='*60}")
+        print(f"[LONG-RUN] {model_type} 训练到 {stage_steps} steps (delta={delta})")
+        print(f"{'='*60}")
+        model.learn(
+            total_timesteps=delta,
+            progress_bar=True,
+            tb_log_name="tb",
+            reset_num_timesteps=False,
+        )
+        current_steps = stage_steps
+
+        det_summary = evaluate_trained_model(
+            model,
+            dag_cfg,
+            norm_path,
+            deterministic=True,
+            eval_cases=eval_cases,
+        )
+        stochastic_summary = evaluate_trained_model(
+            model,
+            dag_cfg,
+            norm_path,
+            deterministic=False,
+            eval_cases=eval_cases,
+        )
+
+        beat_mean_aft = det_summary["mean_AFT_avg"] < baseline_summary["mean_AFT_avg"]
+        beat_makespan = det_summary["makespan_avg"] < baseline_summary["makespan_avg"]
+        beat_both = beat_mean_aft and beat_makespan
+        stage_key = str(stage_steps)
+        stage_results[stage_key] = {
+            "steps": float(stage_steps),
+            "det_mean_AFT_avg": det_summary["mean_AFT_avg"],
+            "det_makespan_avg": det_summary["makespan_avg"],
+            "stochastic_mean_AFT_avg": stochastic_summary["mean_AFT_avg"],
+            "stochastic_makespan_avg": stochastic_summary["makespan_avg"],
+            "improvement_mean_AFT_vs_greedy": baseline_summary["mean_AFT_avg"] - det_summary["mean_AFT_avg"],
+            "improvement_makespan_vs_greedy": baseline_summary["makespan_avg"] - det_summary["makespan_avg"],
+            "beat_greedy_mean_AFT": bool(beat_mean_aft),
+            "beat_greedy_makespan": bool(beat_makespan),
+            "beat_greedy_both": bool(beat_both),
+        }
+        print(
+            f"[LONG-RUN][{stage_steps}] PPO meanAFT={det_summary['mean_AFT_avg']:.6f}, "
+            f"greedy={baseline_summary['mean_AFT_avg']:.6f}, "
+            f"Δ={stage_results[stage_key]['improvement_mean_AFT_vs_greedy']:.6f}"
+        )
+        print(
+            f"[LONG-RUN][{stage_steps}] PPO makespan={det_summary['makespan_avg']:.6f}, "
+            f"greedy={baseline_summary['makespan_avg']:.6f}, "
+            f"Δ={stage_results[stage_key]['improvement_makespan_vs_greedy']:.6f}, "
+            f"beat_both={beat_both}"
+        )
+
+        ckpt_path = os.path.join(run_dic, f"checkpoint_steps_{stage_steps}.zip")
+        model.save(ckpt_path)
+        if isinstance(trainer.vec_env, VecNormalize):
+            trainer.vec_env.save(norm_path)
+
+    final_model_path = os.path.join(run_dic, "final_model.zip")
+    model.save(final_model_path)
+    if isinstance(trainer.vec_env, VecNormalize):
+        trainer.vec_env.save(norm_path)
+
+    last_stage = str(unique_stages[-1])
+    success = bool(stage_results[last_stage]["beat_greedy_both"])
+    longest_success = any(r["beat_greedy_both"] for r in stage_results.values())
+
+    results = {
+        "meta": {
+            "model_type": model_type,
+            "training_stages": unique_stages,
+            "n_eval_seeds": n_eval_seeds,
+            "seed_base": seed_base,
+            "baseline_rule": baseline_rule,
+            "run_dir": run_dic,
+            "final_model_path": final_model_path,
+        },
+        "greedy_baseline": baseline_summary,
+        "stages": stage_results,
+        "conclusion": {
+            "latest_stage_beats_greedy_both": success,
+            "any_stage_beats_greedy_both": bool(longest_success),
+            "latest_stage": unique_stages[-1],
+        },
+    }
+
+    import json
+    os.makedirs(train_cfg.log_dir, exist_ok=True)
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    results_path = os.path.join(train_cfg.log_dir, f"long_greedy_results_{ts}.json")
+    with open(results_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    print(f"\n[LONG-RUN] 结果已保存到 {results_path}")
+    print(f"[LONG-RUN] 最新阶段是否超过 greedy baseline: {success}")
+
+    return results
 
 
 def run_comparison_experiment(
@@ -1048,7 +1281,9 @@ if __name__ == "__main__":
 
     dag_cfg = DAGConfig()
 
-    # 通过命令行参数选择: joint | two_stage | dtodrl | dtodrl_tf | comparison | comparison_transformer | reward_comparison
+    # 通过命令行参数选择:
+    # joint | two_stage | dtodrl | dtodrl_tf
+    # comparison | comparison_transformer | reward_comparison | long_greedy
     mode = sys.argv[1] if len(sys.argv) > 1 else "joint"
 
     if mode == "comparison":
@@ -1072,6 +1307,24 @@ if __name__ == "__main__":
             train_cfg, dag_cfg,
             model_type=sys.argv[2] if len(sys.argv) > 2 else "joint",
             n_eval_seeds=30,
+        )
+    elif mode == "long_greedy":
+        # 长程实验：检查 PPO 是否超过 greedy baseline
+        # 用法示例:
+        #   python final_training.py long_greedy
+        #   python final_training.py long_greedy joint 10000,30000,50000
+        model_type = sys.argv[2] if len(sys.argv) > 2 else "joint"
+        stage_text = sys.argv[3] if len(sys.argv) > 3 else "20000,50000,100000"
+        training_stages = [int(x.strip()) for x in stage_text.split(",") if x.strip()]
+        print("运行长程实验: PPO vs greedy baseline ...")
+        run_long_horizon_vs_greedy_experiment(
+            train_cfg,
+            dag_cfg,
+            model_type=model_type,
+            training_stages=training_stages,
+            n_eval_seeds=30,
+            seed_base=5000,
+            baseline_rule="topo",
         )
     else:
         # 单方法训练
